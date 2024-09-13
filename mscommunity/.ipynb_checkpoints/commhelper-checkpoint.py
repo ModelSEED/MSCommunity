@@ -1,5 +1,4 @@
-from modelseedpy.core.msminimalmedia import minimizeFlux_withGrowth, bioFlux_check
-from modelseedpy.core.exceptions import NoFluxError, ObjectiveError
+from modelseedpy.core import minimizeFlux_withGrowth, bioFlux_check, NoFluxError, ObjectiveError
 from modelseedpy.fbapkg.mspackagemanager import MSPackageManager
 from modelseedpy.core.msmodelutl import MSModelUtil
 from modelseedpy.core.fbahelper import FBAHelper
@@ -40,7 +39,7 @@ def correct_nonMSID(nonMSobject, output, model_index):
 
 
 def build_from_species_models(org_models, model_id=None, name=None, abundances=None,
-                              standardize=False, MSmodel = True, commkinetics=True,
+                              standardize=False, MSmodel = False, commkinetics=True,
                               copy_models=True, printing=False):
     """Merges the input list of single species metabolic models into a community metabolic model
 
@@ -185,6 +184,7 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     if hasattr(newutl.model, "_context"):  newutl.model._contents.append(member_biomasses)
     elif hasattr(newutl.model, "notes"):  newutl.model.notes.update({"member_biomass_cpds": member_biomasses})
     # print([cons.name for cons in newutl.model.constraints])
+    if MSmodel:   return newutl
     return newutl.model
 
 

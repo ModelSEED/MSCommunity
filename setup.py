@@ -9,7 +9,7 @@ from setuptools import setup, find_packages
 #     license = f.read()
 
 setup(
-    name="MSCommunity",
+    name="mscommunity",
     version="0.0.1",
     description="Python package for building and analyzing microbial communities using ModelSEED",
     # long_description_content_type="text/x-rst",

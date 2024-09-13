@@ -6,8 +6,7 @@ from modelseedpy.core.msgapfill import MSGapfill
 from modelseedpy.core.fbahelper import FBAHelper
 #from modelseedpy.fbapkg.gapfillingpkg import default_blacklist
 from modelseedpy.core.msatpcorrection import MSATPCorrection
-from mscommunity.mssteadycom import MSSteadyCom
-from mscommunity.commhelper import build_from_species_models
+from mscommunity import MSSteadyCom, build_from_species_models
 from cobra.io import save_matlab_model, write_sbml_model
 from cobra.core.dictlist import DictList
 from optlang.symbolics import Zero

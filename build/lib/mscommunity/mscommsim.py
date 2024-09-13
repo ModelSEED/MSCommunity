@@ -6,7 +6,6 @@ from modelseedpy.core.msgapfill import MSGapfill
 from modelseedpy.core.fbahelper import FBAHelper
 #from modelseedpy.fbapkg.gapfillingpkg import default_blacklist
 from modelseedpy.core.msatpcorrection import MSATPCorrection
-from mscommunity.mssteadycom import MSSteadyCom
 from mscommunity.commhelper import build_from_species_models
 from cobra.io import save_matlab_model, write_sbml_model
 from cobra.core.dictlist import DictList
@@ -251,11 +250,19 @@ class MSCommunity:
 
     # TODO evaluate the comparison of this method with MICOM
     def predict_abundances(self, media=None, pfba=True):
-        with self.util.model:
-            self.util.model.objective = self.util.model.problem.Objective(
-                sum([species.primary_biomass.forward_variable for species in self.members]), direction="max")
-            self.run_fba(media, pfba)
-            return self._compute_relative_abundance_from_solution()
+        # store the original parameters
+        ogObj = self.util.model.objective
+        ogMedia = self.util.model.medium
+        # simulate the model
+        biomasses = [species.primary_biomass.forward_variable for species in self.members]
+        print(biomasses)
+        self.util.model.objective = self.util.model.problem.Objective(sum(biomasses), direction="max")
+        self.run_fba(media, pfba)
+        abundances = self._compute_relative_abundance_from_solution()
+        # reset the model conditions
+        self.util.model.objective = ogObj
+        self.util.model.medium = ogMedia
+        return abundances
 
     def run_fba(self, media=None, pfba=False, fva_reactions=None):
         if media is not None:  self.util.add_medium(media)
