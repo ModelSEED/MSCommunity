@@ -6,13 +6,13 @@ from modelseedpy.core.msgapfill import MSGapfill
 from modelseedpy.core.fbahelper import FBAHelper
 #from modelseedpy.fbapkg.gapfillingpkg import default_blacklist
 from modelseedpy.core.msatpcorrection import MSATPCorrection
-from mscommunity.mssteadycom import MSSteadyCom
 from mscommunity.commhelper import build_from_species_models
 from cobra.io import save_matlab_model, write_sbml_model
 from cobra.core.dictlist import DictList
 from optlang.symbolics import Zero
 from optlang import Constraint
 from os import makedirs, path
+from math import isclose
 from pandas import DataFrame
 from pprint import pprint
 from cobra import Reaction
@@ -250,21 +250,49 @@ class MSCommunity:
         self.atp = MSATPCorrection(self.util.model, core_template, atp_medias, "c0", max_gapfilling, gapfilling_delta)
 
     # TODO evaluate the comparison of this method with MICOM
-    def predict_abundances(self, media=None, pfba=True):
-        with self.util.model:
-            self.util.model.objective = self.util.model.problem.Objective(
-                sum([species.primary_biomass.forward_variable for species in self.members]), direction="max")
+    def predict_abundances(self, media=None, pfba=True, timeout=60):
+        slimOpt = self.util.model.slim_optimize()
+        if isclose(0, slimOpt, abs_tol=1e-3):
+            print(f"The model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt}")
+        # store the original parameters
+        ogObj = self.util.model.objective
+        ogMedia = self.util.model.medium
+        ogTimeout = self.util.model.solver.configuration.timeout
+        # simulate the model
+        biomasses = [species.primary_biomass.forward_variable for species in self.members]
+        self.util.model.objective = self.util.model.problem.Objective(sum(biomasses), direction="max")
+        self.util.model.solver.configuration.timeout = timeout
+        try:
             self.run_fba(media, pfba)
-            return self._compute_relative_abundance_from_solution()
+        except:
+            try:
+                self.run_fba(media)
+            except:
+                print(f"The model {self.util.model.id} fails with run_fba, with a slim_optimize of {slimOpt}")
+                try:
+                    from cobra.flux_analysis import pfba
+                    self._set_solution(pfba(self.util.model))
+                except:
+                    print("failed all pFBA attempts")
+                    self.util.add_medium(media)
+                    self._set_solution(self.util.model.optimize())
+        abundances = self._compute_relative_abundance_from_solution()
+        # reset the model conditions
+        self.util.model.solver.configuration.timeout = ogTimeout
+        self.util.model.objective = ogObj
+        self.util.model.medium = ogMedia
+        return abundances
 
     def run_fba(self, media=None, pfba=False, fva_reactions=None):
+        print("pfba =", pfba)
         if media is not None:  self.util.add_medium(media)
         return self._set_solution(self.util.run_fba(None, pfba, fva_reactions))
 
     def _compute_relative_abundance_from_solution(self, solution=None, skipNoGrowth=True):
-        if not solution and not self.solution:  logger.warning("The simulation lacks any flux.")  ;  return None
+        if solution is not None:  self.solution = solution
+        if self.solution is None:  logger.warning("The simulation lacks any flux.")  ;  return None
         comm_growth = sum([self.solution.fluxes[member.primary_biomass.id] for member in self.members])
-        if comm_growth > 0:
+        if isclose(0, comm_growth, abs_tol=1e-3):
             message = f"The total community growth is {comm_growth}"
             if not skipNoGrowth:   NoFluxError(message)
             else:    print(message)  ;  return None
@@ -277,7 +305,7 @@ class MSCommunity:
             self.print_lp()
             save_matlab_model(self.util.model, self.util.model.name + ".mat")
         self.solution = solution
-        logger.info(self.util.model.summary())
+        # logger.info(self.util.model.summary())
         return self.solution
 
     def parse_member_growths(self):

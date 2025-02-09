@@ -1,6 +1,7 @@
 from icecream import ic
 
 from modelseedpy import FBAHelper
+from modelseedpy.biochem import from_local
 from modelseedpy.core.exceptions import ObjectAlreadyDefinedError, ParameterError, NoFluxError
 # from modelseedpy.community.commhelper import build_from_species_models, CommHelper
 from optlang import Constraint, Variable
@@ -11,6 +12,7 @@ from matplotlib import pyplot
 from numpy import array
 import networkx
 import sigfig
+import graphviz
 import os, re
 
 
@@ -215,7 +217,6 @@ class MSSteadyCom:
                             msdb_path=None, view_figure=True, node_metabolites=True):
         # load the MSDB
         assert msdb or msdb_path, ValueError("Either the MSDB object or the local MSDB path must be provided")
-        from modelseedpy.biochem import from_local
         msdb = msdb or from_local(msdb_path)
         # construct the structure of the cross-feeding DataFrame
         if "Metabolite/Donor ID" in cross_feeding_df.columns:
@@ -244,7 +245,6 @@ class MSSteadyCom:
 
         # TODO define a third node tier of just the environment as a rectangle that spans the width of the members
         ## which may alleviate much of the ambiguity about mass imbalance between the member fluxes
-        import graphviz
         dot = graphviz.Digraph(filename, format=export_format)  # directed graph
         # define nodes
         ## top-layer members
