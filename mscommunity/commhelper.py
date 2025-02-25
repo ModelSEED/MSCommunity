@@ -38,9 +38,8 @@ def correct_nonMSID(nonMSobject, output, model_index):
     return "_".join([nonMSobject.id.replace(comp.group(), ""), nonMSobject.compartment])
 
 
-def build_from_species_models(org_models, model_id=None, name=None, abundances=None,
-                              standardize=False, MSmodel = False, commkinetics=True,
-                              copy_models=True, printing=False):
+def build_from_species_models(org_models, model_id=None, name=None, abundances=None, standardize=False, MSmodel = False,
+                              commkinetics=True, copy_models=True, climit=None, o2limit=None, printing=False):
     """Merges the input list of single species metabolic models into a community metabolic model
 
     Parameters
@@ -69,7 +68,7 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     member_biomasses = {}
     models = models if not abundances else [mdl for mdl in models if mdl.id in abundances]
     for model_index, org_model in enumerate(models):
-        model_util = MSModelUtil(org_model, copy=copy_models)
+        model_util = MSModelUtil(org_model, copy=copy_models, climit=False, o2limit=False)
         model_reaction_ids = [rxn.id for rxn in model_util.model.reactions]
         model_index += 1
         # if MSmodel:
@@ -175,10 +174,10 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     newmodel.add_metabolites(FBAHelper.filter_cobra_set(new_metabolites))
     newmodel.add_reactions([comm_biorxn])
     newmodel.objective = Objective(comm_biorxn.flux_expression)
-    newutl = MSModelUtil(newmodel)
+    newutl = MSModelUtil(newmodel, climit=climit, o2limit=o2limit)
     # newutl.add_objective(comm_biorxn.flux_expression)
     newutl.model.add_boundary(comm_biomass, "sink") # Is a sink reaction for reversible cpd11416_c0 consumption necessary?
-    ## proportionally limit the fluxes to their abundances 
+    ## proportionally limit the fluxes to their abundances
     # add the metadata of community composition
     print("Community objective", newutl.model.objective.expression)
     if hasattr(newutl.model, "_context"):  newutl.model._contents.append(member_biomasses)
