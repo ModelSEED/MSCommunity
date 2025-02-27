@@ -69,7 +69,7 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     member_biomasses = {}
     models = models if not abundances else [mdl for mdl in models if mdl.id in abundances]
     for model_index, org_model in enumerate(models):
-        model_util = MSModelUtil(org_model, copy=copy_models)
+        model_util = MSModelUtil(org_model, copy_models, no_constraints=True)
         model_reaction_ids = [rxn.id for rxn in model_util.model.reactions]
         model_index += 1
         # if MSmodel:
@@ -175,7 +175,7 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     newmodel.add_metabolites(FBAHelper.filter_cobra_set(new_metabolites))
     newmodel.add_reactions([comm_biorxn])
     newmodel.objective = Objective(comm_biorxn.flux_expression)
-    newutl = MSModelUtil(newmodel)
+    newutl = MSModelUtil(newmodel, False, no_constraints=True)
     # newutl.add_objective(comm_biorxn.flux_expression)
     newutl.model.add_boundary(comm_biomass, "sink") # Is a sink reaction for reversible cpd11416_c0 consumption necessary?
     ## proportionally limit the fluxes to their abundances 
