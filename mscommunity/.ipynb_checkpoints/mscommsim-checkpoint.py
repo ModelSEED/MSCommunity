@@ -79,8 +79,8 @@ class CommunityMember:
 
 
 class MSCommunity:
-    def __init__(self, model=None, member_models: list = None, abundances=None, ids=None, kinetic_coeff=2000,
-                 lp_filename=None, kinCoef=750, probs={}, climit=None, o2limit=None, printing=False):
+    def __init__(self, model=None, member_models: list = None, abundances=None, ids=None, kinetic_coeff=750,
+                 flux_limit=300, probs={}, climit=None, o2limit=None, lp_filename=None, printing=False):
         assert model is not None or member_models is not None, "Either the community model and the member models must be defined."
         self.lp_filename = lp_filename
         self.gapfillings = {}
@@ -245,8 +245,9 @@ class MSCommunity:
     # TODO evaluate the comparison of this method with MICOM
     def predict_abundances(self, media=None, pfba=True, timeout=60, environName=None):
         slimOpt = self.util.model.slim_optimize()
+        mediaName = f" in {environName} media" if environName else ""
         if isclose(0, slimOpt, abs_tol=1e-3):
-            print(f"The model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt}")
+            print(f"The model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt}"+mediaName)
         # store the original parameters
         ogObj = self.util.model.objective
         ogMedia = self.util.model.medium
@@ -259,12 +260,12 @@ class MSCommunity:
         except:
             try:  self.run_fba(media)
             except:
-                print(f"The model {self.util.model.id} fails with run_fba, with a slim_optimize of {slimOpt}")
+                print(f"The model {self.util.model.id} fails with run_fba, with a slim_optimize of {slimOpt}"+mediaName)
                 try:
                     from cobra.flux_analysis import pfba
                     self._set_solution(pfba(self.util.model))
                 except:
-                    print("failed all pFBA attempts")
+                    print("failed all pFBA attempts"+mediaName)
                     self.util.add_medium(media)
                     self._set_solution(self.util.model.optimize())
         abundances = self._compute_relative_abundance_from_solution()
