@@ -80,7 +80,8 @@ class CommunityMember:
 
 
 class MSCommunity:
-    def __init__(self, model=None, member_models: list = None, abundances=None, ids=None, kinetic_coeff=2000, lp_filename=None, flux_limit=300, printing=False):
+    def __init__(self, model=None, member_models: list = None, abundances=None, ids=None, kinetic_coeff=750,
+                 lp_filename=None, flux_limit=300, printing=False, climit=None, o2limit=None):
         assert model is not None or member_models is not None, "Either the community model and the member models must be defined."
         self.lp_filename = lp_filename
         self.gapfillings = {}
@@ -93,7 +94,7 @@ class MSCommunity:
             model = build_from_species_models(member_models, abundances=abundances, printing=printing)
         if ids is None:  ids = [mem.id for mem in member_models]
         self.id = model.id
-        self.util = MSModelUtil(model, True)
+        self.util = MSModelUtil(model, True, None, climit, o2limit)
         self.pkgmgr = MSPackageManager.get_pkg_mgr(self.util.model)
         # print(msid_cobraid_hash)
         # write_sbml_model(model, "test_comm.xml")
@@ -250,10 +251,11 @@ class MSCommunity:
         self.atp = MSATPCorrection(self.util.model, core_template, atp_medias, "c0", max_gapfilling, gapfilling_delta)
 
     # TODO evaluate the comparison of this method with MICOM
-    def predict_abundances(self, media=None, pfba=True, timeout=60):
+    def predict_abundances(self, media=None, pfba=True, timeout=60, environName=None):
         slimOpt = self.util.model.slim_optimize()
+        mediaName = f" in {environName} media" if environName else ""
         if isclose(0, slimOpt, abs_tol=1e-3):
-            print(f"The model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt}")
+            print(f"The model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt}"+mediaName)
         # store the original parameters
         ogObj = self.util.model.objective
         ogMedia = self.util.model.medium
@@ -268,12 +270,12 @@ class MSCommunity:
             try:
                 self.run_fba(media)
             except:
-                print(f"The model {self.util.model.id} fails with run_fba, with a slim_optimize of {slimOpt}")
+                print(f"The model {self.util.model.id} fails with run_fba, with a slim_optimize of {slimOpt}"+mediaName)
                 try:
                     from cobra.flux_analysis import pfba
                     self._set_solution(pfba(self.util.model))
                 except:
-                    print("failed all pFBA attempts")
+                    print("failed all pFBA attempts"+mediaName)
                     self.util.add_medium(media)
                     self._set_solution(self.util.model.optimize())
         abundances = self._compute_relative_abundance_from_solution()

@@ -12,6 +12,7 @@ from cobra.core.dictlist import DictList
 from optlang.symbolics import Zero
 from optlang import Constraint
 from os import makedirs, path
+from math import isclose
 from pandas import DataFrame
 from pprint import pprint
 from cobra import Reaction
@@ -79,7 +80,8 @@ class CommunityMember:
 
 
 class MSCommunity:
-    def __init__(self, model=None, member_models: list = None, abundances=None, ids=None, kinetic_coeff=2000, lp_filename=None, flux_limit=300, printing=False):
+    def __init__(self, model=None, member_models: list = None, abundances=None, ids=None, kinetic_coeff=750,
+                 lp_filename=None, flux_limit=300, printing=False, climit=None, o2limit=None):
         assert model is not None or member_models is not None, "Either the community model and the member models must be defined."
         self.lp_filename = lp_filename
         self.gapfillings = {}
@@ -92,7 +94,7 @@ class MSCommunity:
             model = build_from_species_models(member_models, abundances=abundances, printing=printing)
         if ids is None:  ids = [mem.id for mem in member_models]
         self.id = model.id
-        self.util = MSModelUtil(model, True)
+        self.util = MSModelUtil(model, True, None, climit, o2limit)
         self.pkgmgr = MSPackageManager.get_pkg_mgr(self.util.model)
         # print(msid_cobraid_hash)
         # write_sbml_model(model, "test_comm.xml")
@@ -249,29 +251,50 @@ class MSCommunity:
         self.atp = MSATPCorrection(self.util.model, core_template, atp_medias, "c0", max_gapfilling, gapfilling_delta)
 
     # TODO evaluate the comparison of this method with MICOM
-    def predict_abundances(self, media=None, pfba=True):
+    def predict_abundances(self, media=None, pfba=True, timeout=60, environName=None):
+        slimOpt = self.util.model.slim_optimize()
+        mediaName = f" in {environName} media" if environName else ""
+        if isclose(0, slimOpt, abs_tol=1e-3):
+            print(f"The model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt}"+mediaName)
         # store the original parameters
         ogObj = self.util.model.objective
         ogMedia = self.util.model.medium
+        ogTimeout = self.util.model.solver.configuration.timeout
         # simulate the model
         biomasses = [species.primary_biomass.forward_variable for species in self.members]
-        print(biomasses)
         self.util.model.objective = self.util.model.problem.Objective(sum(biomasses), direction="max")
-        self.run_fba(media, pfba)
+        self.util.model.solver.configuration.timeout = timeout
+        try:
+            self.run_fba(media, pfba)
+        except:
+            try:
+                self.run_fba(media)
+            except:
+                print(f"The model {self.util.model.id} fails with run_fba, with a slim_optimize of {slimOpt}"+mediaName)
+                try:
+                    from cobra.flux_analysis import pfba
+                    self._set_solution(pfba(self.util.model))
+                except:
+                    print("failed all pFBA attempts"+mediaName)
+                    self.util.add_medium(media)
+                    self._set_solution(self.util.model.optimize())
         abundances = self._compute_relative_abundance_from_solution()
         # reset the model conditions
+        self.util.model.solver.configuration.timeout = ogTimeout
         self.util.model.objective = ogObj
         self.util.model.medium = ogMedia
         return abundances
 
     def run_fba(self, media=None, pfba=False, fva_reactions=None):
+        print("pfba =", pfba)
         if media is not None:  self.util.add_medium(media)
         return self._set_solution(self.util.run_fba(None, pfba, fva_reactions))
 
     def _compute_relative_abundance_from_solution(self, solution=None, skipNoGrowth=True):
-        if not solution and not self.solution:  logger.warning("The simulation lacks any flux.")  ;  return None
+        if solution is not None:  self.solution = solution
+        if self.solution is None:  logger.warning("The simulation lacks any flux.")  ;  return None
         comm_growth = sum([self.solution.fluxes[member.primary_biomass.id] for member in self.members])
-        if comm_growth > 0:
+        if isclose(0, comm_growth, abs_tol=1e-3):
             message = f"The total community growth is {comm_growth}"
             if not skipNoGrowth:   NoFluxError(message)
             else:    print(message)  ;  return None
@@ -284,7 +307,7 @@ class MSCommunity:
             self.print_lp()
             save_matlab_model(self.util.model, self.util.model.name + ".mat")
         self.solution = solution
-        logger.info(self.util.model.summary())
+        # logger.info(self.util.model.summary())
         return self.solution
 
     def parse_member_growths(self):
