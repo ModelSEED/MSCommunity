@@ -142,7 +142,7 @@ class MSCommunity:
         if isinstance(abundances, dict):  self.set_abundance(abundances)
         self.rxnProbs = probs
         # self.pkgmgr.getpkg("CommKineticPkg").build_package(kinetic_coeff, self, self.rxnProbs)
-        if kinCoef is not None:   self.add_commkinetics(kinCoef, probs)
+        if kinetic_coeff is not None:   self.add_commkinetics(kinetic_coeff, probs)
         
 
     #Manipulation functions
@@ -301,7 +301,7 @@ class MSCommunity:
         return self.solution
 
     def member_growths(self):
-        return {member.name: self.solution.fluxes[member.primary_biomass.id] for member in self.members}
+        return {member.id: self.solution.fluxes[member.primary_biomass.id] for member in self.members}
 
     def return_member_models(self):
         # TODO return a list of member models that is parsed from the .members attribute
