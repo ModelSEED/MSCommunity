@@ -11,6 +11,7 @@ from mscommunity.mscommviz import interactions as mscommsim_interactions
 from cobra.io import save_matlab_model, write_sbml_model
 from cobra.core.dictlist import DictList
 from optlang.symbolics import Zero
+from cobra.flux_analysis import pfba
 from cobra import Reaction, Model
 from os import makedirs, path
 from math import isclose
@@ -33,30 +34,29 @@ class CommunityMember:
         if ID is not None:  self.id = ID
         elif "species_name" in self.biomass_cpd.annotation:
             self.id = self.biomass_cpd.annotation["species_name"]
-        else:  self.id = "Species"+str(self.index)
+        else:  self.id = f"Species{self.index}"
 
-        logger.info("Making atp hydrolysis reaction for species: "+self.id)
-        atp_rxn = self.community.util.add_atp_hydrolysis("c"+str(self.index))
+        logger.info(f"Making atp hydrolysis reaction for species: {self.id}")
+        atp_rxn = self.community.util.add_atp_hydrolysis(f"c{self.index}")
         self.atp_hydrolysis = atp_rxn["reaction"]
         self.biomass_drain = self.primary_biomass = None
         self.reactions = []
         for rxn in self.community.util.model.reactions:
             # print(rxn.id, rxn.reaction, "\t\t\t", end="\r")
             rxnComp = FBAHelper.rxn_compartment(rxn)
-            if rxnComp is None:  print(f"The reaction {rxn.id} compartment is undefined.")
-            if rxnComp[1:] == '': print("no compartment", rxn, rxnComp)
+            if rxnComp is None:  print(f"The reaction {rxn.id} compartment {rxnComp} is undefined.")
+            elif rxnComp[1:] == '': print("no compartment", rxn, rxnComp)
             elif int(rxnComp[1:]) == self.index and 'bio' not in rxn.name:  self.reactions.append(rxn)
-            if self.biomass_cpd.id not in [met.id for met in rxn.metabolites]:   continue
-            for met in rxn.metabolites:
-                if met.id != self.biomass_cpd.id:  continue
-                if rxn.metabolites[met] == 1 and len(rxn.metabolites) > 1:  self.primary_biomass = rxn  ;  break
-                elif len(rxn.metabolites) == 1 and rxn.metabolites[met] < 0:  self.biomass_drain = rxn
+            mets = {met.id: met for met in rxn.metabolites}
+            if self.biomass_cpd.id not in mets:   continue
+            met = mets[self.biomass_cpd.id]
+            if rxn.metabolites[met] == 1 and len(rxn.metabolites) > 1:  self.primary_biomass = rxn  ;  break
+            elif len(rxn.metabolites) == 1 and rxn.metabolites[met] < 0:  self.biomass_drain = rxn
 
-        if self.primary_biomass is None:  logger.critical("No biomass reaction found for species " + self.id)
+        if self.primary_biomass is None:  print(f"No biomass reaction found for species {self.id}")
         if not self.biomass_drain:
-            logger.info("Making biomass drain reaction for species: "+self.id)
-            self.biomass_drain = Reaction(
-                id="DM_"+self.biomass_cpd.id, name="DM_" + self.biomass_cpd.name, lower_bound=0, upper_bound=100)
+            print(f"Making biomass drain reaction for species: {self.id}")
+            self.biomass_drain = Reaction(id=f"DM_{self.biomass_cpd.id}", name=f"DM_{self.biomass_cpd.name}", lower_bound=0, upper_bound=100)
             self.community.util.model.add_reactions([self.biomass_drain])
             self.biomass_drain.add_metabolites({self.biomass_cpd: -1})
             self.biomass_drain.annotation["sbo"] = 'SBO:0000627'
@@ -152,7 +152,7 @@ class MSCommunity:
         # map abundances to all species
         for modelID, content in abundances.items():
             if modelID in self.members:  self.members.get_by_id(modelID).abundance = content["abundance"]/total_abundance
-        #remake the primary biomass reaction based on abundances
+        #remake the primary biomass reaction based on abundances  #TODO what is the purpose of this?
         if self.primary_biomass is None:  logger.critical("Primary biomass reaction not found in community model")
         all_metabolites = {self.primary_biomass.products[0]: 1}
         all_metabolites.update({mem.biomass_cpd: -abundances[mem.id]["abundance"]/total_abundance for mem in self.members})
@@ -180,6 +180,7 @@ class MSCommunity:
                                         visualize, filename, figure_format, node_metabolites, True, ignore_mets)
 
     def add_commkinetics(self, kinCoef=750, probs={}):  #, abundances):
+        # kinCoef * bio_f 
         # TODO this creates an error with the member biomass reactions not being identified in the model
         self.rxnProbs = probs
         self.kinCoef = kinCoef
@@ -195,7 +196,7 @@ class MSCommunity:
                 rxnIndex = int(FBAHelper.rxn_compartment(rxn)[1:])
                 if (rxnIndex == species.index and rxn != species.primary_biomass):
                     coef[rxn.forward_variable] = coef[rxn.reverse_variable] = self.rxnProbs.get(rxn.id, 1)
-            self.util.create_constraint(self.util.model.problem.Constraint(Zero, name=f"{species.id}_commKin"), coef=coef, printing=True)
+            self.util.create_constraint(self.util.model.problem.Constraint(Zero, name=f"{species.id}_commKin", ub=0), coef=coef, printing=True)
 
     #Utility functions
     def print_lp(self, filename=None):
@@ -245,27 +246,25 @@ class MSCommunity:
     # TODO evaluate the comparison of this method with MICOM
     def predict_abundances(self, media=None, pfba=True, timeout=60, environName=None):
         slimOpt = self.util.model.slim_optimize()
-        mediaName = f" in {environName} media" if environName else ""
         if isclose(0, slimOpt, abs_tol=1e-3):
-            print(f"The model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt}"+mediaName)
+            print(f"The model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt} in {environName} media")
         # store the original parameters
         ogObj = self.util.model.objective
         ogMedia = self.util.model.medium
         ogTimeout = self.util.model.solver.configuration.timeout
         # simulate the model
-        biomasses = [species.primary_biomass.forward_variable for species in self.members]
-        self.util.model.objective = self.util.model.problem.Objective(sum(biomasses), direction="max")
+        ## maximize the sum of all member biomass reactions
+        self.set_objective(sum([species.primary_biomass.forward_variable for species in self.members]), direction="max")
         self.util.model.solver.configuration.timeout = timeout
         try:    self.run_fba(media, pfba)
         except:
             try:  self.run_fba(media)
             except:
-                print(f"The model {self.util.model.id} fails with run_fba, with a slim_optimize of {slimOpt}"+mediaName)
+                print(f"The model {self.util.model.id} fails with run_fba, with a slim_optimize of {slimOpt} in {environName} media")
                 try:
-                    from cobra.flux_analysis import pfba
                     self._set_solution(pfba(self.util.model))
                 except:
-                    print("failed all pFBA attempts"+mediaName)
+                    print("failed all pFBA attempts in {environName} media")
                     self.util.add_medium(media)
                     self._set_solution(self.util.model.optimize())
         abundances = self._compute_relative_abundance_from_solution()
@@ -282,7 +281,7 @@ class MSCommunity:
 
     def _compute_relative_abundance_from_solution(self, solution=None, skipNoGrowth=True):
         if solution is not None:  self.solution = solution
-        if self.solution is None:  logger.warning("The simulation lacks any flux.")  ;  return None
+        if self.solution is None:  NoFluxError("The simulation lacks any flux.")  ;  return None
         comm_growth = sum([self.solution.fluxes[member.primary_biomass.id] for member in self.members])
         if isclose(0, comm_growth, abs_tol=1e-3):
             message = f"The total community growth is {comm_growth}"
@@ -297,6 +296,7 @@ class MSCommunity:
             self.print_lp()
             save_matlab_model(self.util.model, self.util.model.name + ".mat")
         self.solution = solution
+        self.memGrowths = self.member_growths()
         # logger.info(self.util.model.summary())
         return self.solution
 
