@@ -7,6 +7,7 @@ from modelseedpy.core.fbahelper import FBAHelper
 #from modelseedpy.fbapkg.gapfillingpkg import default_blacklist
 from modelseedpy.core.msatpcorrection import MSATPCorrection
 from mscommunity.commhelper import build_from_species_models
+from mscommunity.mscommviz import interactions as mscommsim_interactions
 from cobra.io import save_matlab_model, write_sbml_model
 from cobra.core.dictlist import DictList
 from optlang.symbolics import Zero
@@ -94,7 +95,7 @@ class MSCommunity:
         self.id = model.id
         self.util = MSModelUtil(model, True, None, climit, o2limit)
         self.pkgmgr = MSPackageManager.get_pkg_mgr(self.util.model)
-        msid_cobraid_hash = self.util.msid_hash()
+        msid_cobraid_hash = self.util.msid_hash()  # dict of list() of metabolite objects by their msid
         if "cpd11416" not in msid_cobraid_hash:  raise KeyError("Could not find biomass compound for the model.")
         other_biomass_cpds = []
         for self.biomass_cpd in msid_cobraid_hash["cpd11416"]:
@@ -135,11 +136,10 @@ class MSCommunity:
         # self.members = DictList(
         #     CommunityMember(community=self, biomass_cpd=biomass_cpd, name=ids[memIndex], abundance=abundances[memIndex])
         #     for memIndex, biomass_cpd in enumerate(other_biomass_cpds))
+        self.set_abundance(abundances)
 
         
         # assign the MSCommunity constraints and objective
-        self.abundances_set = False
-        if isinstance(abundances, dict):  self.set_abundance(abundances)
         self.rxnProbs = probs
         # self.pkgmgr.getpkg("CommKineticPkg").build_package(kinetic_coeff, self, self.rxnProbs)
         if kinetic_coeff is not None:   self.add_commkinetics(kinetic_coeff, probs)
@@ -176,7 +176,7 @@ class MSCommunity:
 
     def interactions(self, solution=None, media=None, msdb=None, msdb_path=None, filename=None, figure_format="svg",
                      node_metabolites=True, flux_threshold=1, visualize=True, ignore_mets=None):
-        return MSSteadyCom.interactions(self, solution or self.solution, media, flux_threshold, msdb, msdb_path,
+        return mscommsim_interactions(self, solution or self.solution, media, flux_threshold, msdb, msdb_path,
                                         visualize, filename, figure_format, node_metabolites, True, ignore_mets)
 
     def add_commkinetics(self, kinCoef=750, probs={}):  #, abundances):
