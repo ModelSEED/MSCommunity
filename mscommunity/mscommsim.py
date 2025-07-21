@@ -254,7 +254,7 @@ class MSCommunity:
         ogTimeout = self.util.model.solver.configuration.timeout
         # simulate the model
         ## maximize the sum of all member biomass reactions
-        self.set_objective(sum([species.primary_biomass.forward_variable for species in self.members]), direction="max")
+        self.set_objective(targets=[species.primary_biomass.forward_variable for species in self.members])
         self.util.model.solver.configuration.timeout = timeout
         try:    self.run_fba(media, pfba)
         except:
