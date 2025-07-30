@@ -86,6 +86,7 @@ class MSCommunity:
                  flux_limit=300, probs={}, climit=None, o2limit=None, lp_filename=None, printing=False):
         assert model is not None or member_models is not None, "Either the community model and the member models must be defined."
         self.lp_filename = lp_filename
+        self.printing = printing
         self.gapfillings = {}
 
         #Define Data attributes as None
@@ -143,8 +144,8 @@ class MSCommunity:
         
         # assign the MSCommunity constraints and objective
         self.rxnProbs = probs
-        # self.pkgmgr.getpkg("CommKineticPkg").build_package(kinetic_coeff, self, self.rxnProbs)
-        if kinetic_coeff is not None:   self.add_commkinetics(kinetic_coeff, probs)
+        self.pkgmgr.getpkg("CommKineticPkg").build_package(kinetic_coeff, self, self.rxnProbs)
+        # if kinetic_coeff is not None:   self.add_commkinetics(kinetic_coeff, probs)
         
 
     #Manipulation functions
@@ -154,6 +155,7 @@ class MSCommunity:
         # map abundances to all species
         for modelID, content in abundances.items():
             if modelID in self.members:  self.members.get_by_id(modelID).abundance = content["abundance"]/total_abundance
+        self.abundances = {mem.id: mem.abundance for mem in self.members}
         #remake the primary biomass reaction based on abundances  #TODO what is the purpose of this?
         if self.primary_biomass is None:  logger.critical("Primary biomass reaction not found in community model")
         all_metabolites = {self.primary_biomass.products[0]: 1}
@@ -243,6 +245,16 @@ class MSCommunity:
     def atp_correction(self, core_template, atp_medias, max_gapfilling=None, gapfilling_delta=0):
         self.atp = MSATPCorrection(self.util.model, core_template, atp_medias, "c0", max_gapfilling, gapfilling_delta)
 
+
+    def _regularization(self, linear=True):
+        if linear:
+            # TODO create a threshold for the absolute difference between biomasses of the community members
+            pass
+        else:
+            # TODO create the least-squares method employed in MICOM
+            pass
+
+
     # TODO evaluate the comparison of this method with MICOM
     def predict_abundances(self, media=None, pfba=True, timeout=60, environName=None):
         slimOpt = self.util.model.slim_optimize()
@@ -255,6 +267,7 @@ class MSCommunity:
         # simulate the model
         ## maximize the sum of all member biomass reactions
         self.set_objective(targets=[species.primary_biomass.forward_variable for species in self.members])
+        self._regularization()
         self.util.model.solver.configuration.timeout = timeout
         try:    self.run_fba(media, pfba)
         except:
@@ -293,12 +306,13 @@ class MSCommunity:
             self.print_lp()
             save_matlab_model(self.util.model, self.util.model.name + ".mat")
         self.solution = solution
-        self.member_fluxes = {}
+        self.member_fluxes, self.memGrowths = {}, {}
         for mem in self.members:
             self.member_fluxes[mem.id] = array([solution.fluxes[rxn.id] for rxn in mem.reactions])
-            print(mem.id, mem.primary_biomass.id, self.solution.fluxes[mem.primary_biomass.id])
-        print("Total fluxes:", {memID: sum(abs(fluxes)) for memID, fluxes in self.member_fluxes.items()})
-        self.memGrowths = {member.id: self.solution.fluxes[member.primary_biomass.id] for member in self.members}
+            self.memGrowths[mem.id] = self.solution.fluxes[mem.primary_biomass.id]
+        if self.printing:
+            print("Member Biomass Fluxes:", self.memGrowths)
+            print("Total fluxes:", {memID: sum(abs(fluxes)) for memID, fluxes in self.member_fluxes.items()})
         # logger.info(self.util.model.summary())
         return self.solution
 
@@ -318,3 +332,7 @@ class MSCommunity:
             models.append(model)
         
         return models
+
+    def add_medium(self, media):
+        self.util.add_medium(media)
+        
