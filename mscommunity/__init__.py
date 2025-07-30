@@ -6,5 +6,5 @@ from __future__ import absolute_import
 
 from mscommunity.mscommsim import *
 from mscommunity.commkineticpkg import CommKineticPkg
-from mscommunity.mscommviz import MSSteadyCom
+from mscommunity.mscommviz import *
 from mscommunity.mskineticsfba import MSKineticsFBA

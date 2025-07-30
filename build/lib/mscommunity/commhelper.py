@@ -174,7 +174,7 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     newmodel.add_metabolites(FBAHelper.filter_cobra_set(new_metabolites))
     newmodel.add_reactions([comm_biorxn])
     newmodel.objective = Objective(comm_biorxn.flux_expression)
-    newutl = MSModelUtil(newmodel, climit=climit, o2limit=o2limit)
+    newutl = MSModelUtil(newmodel, False, climit=climit, o2limit=o2limit)
     # newutl.add_objective(comm_biorxn.flux_expression)
     newutl.model.add_boundary(comm_biomass, "sink") # Is a sink reaction for reversible cpd11416_c0 consumption necessary?
     ## proportionally limit the fluxes to their abundances

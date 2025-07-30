@@ -1,2 +1,5 @@
 MSCommunity.egg-info/*
 .DS_Store
+*/__pycache__/*
+*/__pycache__
+mscommunity/__pycache__/__init__.cpython-312.pyc
