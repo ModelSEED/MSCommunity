@@ -9,6 +9,7 @@ from modelseedpy.core.msatpcorrection import MSATPCorrection
 from mscommunity.commhelper import build_from_species_models
 from mscommunity.mscommviz import interactions as mscommsim_interactions
 from cobra.io import save_matlab_model, write_sbml_model
+from itertools import combinations, permutations
 from cobra.core.dictlist import DictList
 from optlang.symbolics import Zero
 from cobra.flux_analysis import pfba
@@ -249,7 +250,20 @@ class MSCommunity:
     def _regularization(self, linear=True):
         if linear:
             # TODO create a threshold for the absolute difference between biomasses of the community members
-            pass
+            for threshold in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
+                for mem1, mem2 in permutations(self.members, 2):
+                    ## mu_i - mu_j <= threshold   &   mu_j - mu_i <= threshold
+                    consName = f"{mem1.id}_{mem2.id}_regularization"
+                    if consName in self.util.model.constraints:
+                        print(f"Removing {consName} from {self.util.model.id}")
+                        self.util.model.remove_cons_vars(self.util.model.constraints[consName])
+                    coef = {mem1.primary_biomass.forward_variable: 1, mem2.primary_biomass.forward_variable: -1}
+                    self.util.create_constraint(self.util.model.problem.Constraint(Zero, name=consName, ub=threshold), coef=coef, printing=True)
+                sol = self.util.model.slim_optimize()
+                if sol.status == "optimal":
+                    if self.printing:
+                        print(f"The model {self.util.model.id} is regularized with a max member growth difference of {threshold}")
+                    return threshold
         else:
             # TODO create the least-squares method employed in MICOM
             pass
@@ -265,20 +279,12 @@ class MSCommunity:
         ogMedia = self.util.model.medium
         ogTimeout = self.util.model.solver.configuration.timeout
         # simulate the model
-        ## maximize the sum of all member biomass reactions
+        ## maximize the sum of all member biomass reactions)
         self.set_objective(targets=[species.primary_biomass.forward_variable for species in self.members])
-        self._regularization()
         self.util.model.solver.configuration.timeout = timeout
+        threshold = self._regularization(linear=True)
         try:    self.run_fba(media, pfba)
-        except:
-            try:  self.run_fba(media)
-            except:
-                try:
-                    self._set_solution(pfba(self.util.model))
-                except:
-                    print("failed all pFBA attempts in {environName} media")
-                    self.util.add_medium(media)
-                    self._set_solution(self.util.model.optimize())
+        except: self.run_fba(media, pfba=False)
         # reset the model conditions
         self.util.model.solver.configuration.timeout = ogTimeout
         self.util.model.objective = ogObj
