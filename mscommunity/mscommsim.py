@@ -14,7 +14,7 @@ from cobra.core.dictlist import DictList
 from optlang.symbolics import Zero
 from cobra.flux_analysis import pfba
 from cobra import Reaction, Model
-from numpy import array
+from numpy import array, logspace
 from os import makedirs, path
 from math import isclose
 from pandas import DataFrame
@@ -91,8 +91,10 @@ class MSCommunity:
         self.gapfillings = {}
 
         #Define Data attributes as None
-        self.solution = self.biomass_cpd = self.primary_biomass = self.biomass_drain = None
-        self.msgapfill = self.element_uptake_limit = self.kinetic_coeff = self.msdb_path = None
+        for attr in ['solution', 'biomass_cpd', 'primary_biomass', 'biomass_drain', 'threshold', 'msgapfill', 
+                     'element_uptake_limit', 'msdb_path', 'comm_growth', 'threshold']:
+            setattr(self, attr, None)
+        self.kinCoef = kinetic_coeff
         # defining the models
         if model is None and member_models is not None:
             model = build_from_species_models(member_models, abundances=abundances, printing=printing)
@@ -247,22 +249,31 @@ class MSCommunity:
         self.atp = MSATPCorrection(self.util.model, core_template, atp_medias, "c0", max_gapfilling, gapfilling_delta)
 
 
-    def _regularization(self, linear=True):
+    def _remove_regularization_constraints(self):
+        for cons in self.util.model.constraints:
+            consName = cons.name
+            if "_regularization" not in consName:  continue
+            if self.printing:   print(f"Removing {consName} from {self.util.model.id}")
+            self.util.model.remove_cons_vars(cons)
+
+    def regularization(self, linear=True):
+        self._remove_regularization_constraints()
         if linear:
             # TODO create a threshold for the absolute difference between biomasses of the community members
-            for threshold in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
+            for threshold in [0.1, 0.5]+list(logspace(-0, 1, 8)):  # growth differences to check
                 for mem1, mem2 in permutations(self.members, 2):
                     ## mu_i - mu_j <= threshold   &   mu_j - mu_i <= threshold
                     consName = f"{mem1.id}_{mem2.id}_regularization"
-                    if consName in self.util.model.constraints:
-                        print(f"Removing {consName} from {self.util.model.id}")
-                        self.util.model.remove_cons_vars(self.util.model.constraints[consName])
+                    # if consName in self.util.model.constraints:
+                    #     print(f"Removing {consName} from {self.util.model.id}")
+                    #     self.util.model.remove_cons_vars(self.util.model.constraints[consName])
                     coef = {mem1.primary_biomass.forward_variable: 1, mem2.primary_biomass.forward_variable: -1}
                     self.util.create_constraint(self.util.model.problem.Constraint(Zero, name=consName, ub=threshold), coef=coef, printing=True)
-                sol = self.util.model.slim_optimize()
+                # print()
+                sol = self.util.model.optimize()
                 if sol.status == "optimal":
-                    if self.printing:
-                        print(f"The model {self.util.model.id} is regularized with a max member growth difference of {threshold}")
+                    # if self.printing:
+                    print(f"The model {self.util.model.id} is regularized with a max member growth difference of {threshold}")
                     return threshold
         else:
             # TODO create the least-squares method employed in MICOM
@@ -270,7 +281,7 @@ class MSCommunity:
 
 
     # TODO evaluate the comparison of this method with MICOM
-    def predict_abundances(self, media=None, pfba=True, timeout=60, environName=None):
+    def predict_abundances(self, media=None, pfba=True, timeout=60, environName=None, regularization=True, update_abundances=False):
         slimOpt = self.util.model.slim_optimize()
         if isclose(0, slimOpt, abs_tol=1e-3):
             print(f"The model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt} in {environName} media")
@@ -282,28 +293,43 @@ class MSCommunity:
         ## maximize the sum of all member biomass reactions)
         self.set_objective(targets=[species.primary_biomass.forward_variable for species in self.members])
         self.util.model.solver.configuration.timeout = timeout
-        threshold = self._regularization(linear=True)
-        try:    self.run_fba(media, pfba)
-        except: self.run_fba(media, pfba=False)
+        commMax = self.util.model.slim_optimize()
+        if regularization:   threshold = self.regularization(linear=True)
+        else:   self._remove_regularization_constraints()
+        commCurrent = self.util.model.slim_optimize()
+        ## TODO why are these community growths identical?
+        print(f"Max community growth ({commMax}) and after regularization ({commCurrent}) in {environName} media")
+
+        # threshold = self._regularization(linear=True)
+        try:    sol = self.run_fba(media, pfba)
+        except: sol = self.run_fba(media, pfba=False)
+        # if sol.status != "optimal":
+        #     raise FeasibilityError(f"The simulation for minimal uptake in {self.util.model.id} was {sol.status}.")
         # reset the model conditions
         self.util.model.solver.configuration.timeout = ogTimeout
         self.util.model.objective = ogObj
         self.util.model.medium = ogMedia
-        return self._compute_relative_abundance_from_solution()
+        return self._compute_relative_abundance_from_solution(sol, True, update_abundances)
 
     def run_fba(self, media=None, pfba=False, fva_reactions=None):
         print("pfba =", pfba)
         if media is not None:  self.util.add_medium(media)
         return self._set_solution(self.util.run_fba(None, pfba, fva_reactions))
 
-    def _compute_relative_abundance_from_solution(self, solution=None, skipNoGrowth=True):
+    def _compute_relative_abundance_from_solution(self, solution=None, skipNoGrowth=True, update_abundances=False):
         solution = solution or self.solution
-        comm_growth = sum([solution.fluxes[member.primary_biomass.id] for member in self.members])
-        if isclose(0, comm_growth, abs_tol=1e-3):
-            message = f"The total community growth is {comm_growth}"
-            if not skipNoGrowth:   NoFluxError(message)
+        total_growth = sum([solution.fluxes[member.primary_biomass.id] for member in self.members])
+        message = f"The total community growth is {total_growth}"
+        if self.printing:  print(message)
+        if isclose(0, total_growth, abs_tol=1e-3):
+            if not skipNoGrowth:   NoFluxError(f"No community growth: {total_growth} in {self.util.model.id}")
             else:    print(message)  ;  return None
-        return {member.id: solution.fluxes[member.primary_biomass.id]/comm_growth for member in self.members}
+        abundances = {member.id: solution.fluxes[member.primary_biomass.id]/total_growth for member in self.members}
+        if update_abundances:
+            self.set_abundance(abundances)
+            if self.printing:  print(f"Updated abundances: {self.abundances}")
+        self.comm_growth = sum([solution.fluxes[mem.primary_biomass.id]*mem.abundance for mem in self.members])
+        return abundances
 
     def _set_solution(self, solution):
         if solution.status != "optimal":
@@ -313,11 +339,14 @@ class MSCommunity:
             save_matlab_model(self.util.model, self.util.model.name + ".mat")
         self.solution = solution
         self.member_fluxes, self.memGrowths = {}, {}
+        self.comm_growth = 0
         for mem in self.members:
             self.member_fluxes[mem.id] = array([solution.fluxes[rxn.id] for rxn in mem.reactions])
             self.memGrowths[mem.id] = self.solution.fluxes[mem.primary_biomass.id]
+            self.comm_growth += self.memGrowths[mem.id] * mem.abundance
         if self.printing:
-            print("Member Biomass Fluxes:", self.memGrowths)
+            print("Member Biomass Fluxes:", self.memGrowths)  # TODO weight the member growths by their abundances
+            print("Max member Fluxes:", {memID: growth*self.kinCoef for memID, growth in self.memGrowths.items()})
             print("Total fluxes:", {memID: sum(abs(fluxes)) for memID, fluxes in self.member_fluxes.items()})
         # logger.info(self.util.model.summary())
         return self.solution
