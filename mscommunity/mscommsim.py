@@ -11,6 +11,7 @@ from mscommunity.mscommviz import interactions as mscommsim_interactions
 from cobra.io import save_matlab_model, write_sbml_model
 from itertools import combinations, permutations
 from cobra.core.dictlist import DictList
+from collections import Counter
 from optlang.symbolics import Zero
 from cobra.flux_analysis import pfba
 from cobra import Reaction, Model
@@ -19,6 +20,7 @@ from os import makedirs, path
 from math import isclose
 from pandas import DataFrame
 from pprint import pprint
+from math import exp
 import logging
 
 logger = logging.getLogger(__name__)
@@ -39,22 +41,30 @@ class CommunityMember:
         else:  self.id = f"Species{self.index}"
 
         logger.info(f"Making atp hydrolysis reaction for species: {self.id}")
-        atp_rxn = self.community.util.add_atp_hydrolysis(f"c{self.index}")
-        self.atp_hydrolysis = atp_rxn["reaction"]
+        self.model = Model()
+        atp_hydrolysis_rxnComp = f"c{self.index}"
+        try:
+            self.atp_hydrolysis = self.community.util.model.reactions.get_by_id(f"rxn00062_{atp_hydrolysis_rxnComp}")
+            print(f"skipping atp hydrolysis rxn00062_{atp_hydrolysis_rxnComp} for {self.id}")
+        except:
+            atp_rxn = self.community.util.add_atp_hydrolysis(atp_hydrolysis_rxnComp)
+            self.atp_hydrolysis = atp_rxn["reaction"]
+            self.model.add_reactions([self.atp_hydrolysis])
+            print(f"created atp hydrolysis reaction rxn00062_{atp_hydrolysis_rxnComp} for {self.id}")
         self.biomass_drain = self.primary_biomass = None
         self.reactions = []
         for rxn in self.community.util.model.reactions:
-            # print(rxn.id, rxn.reaction, "\t\t\t", end="\r")
-            rxnComp = FBAHelper.rxn_compartment(rxn)
-            if rxnComp is None:  print(f"The reaction {rxn.id} compartment {rxnComp} is undefined.")
-            elif rxnComp[1:] == '': print("no compartment", rxn, rxnComp)
-            elif int(rxnComp[1:]) == self.index and 'bio' not in rxn.name:  self.reactions.append(rxn)
-            mets = {met.id: met for met in rxn.metabolites}
-            if self.biomass_cpd.id not in mets:   continue
-            # TODO when would the following code ever be run considering that "bio" is specifically filtered out?
-            met = mets[self.biomass_cpd.id]
-            if rxn.metabolites[met] == 1 and len(rxn.metabolites) > 1:  self.primary_biomass = rxn  ;  break
-            elif len(rxn.metabolites) == 1 and rxn.metabolites[met] < 0:  self.biomass_drain = rxn
+            if "bio" in rxn.id:
+                mets = {met.id: met for met in rxn.metabolites}
+                if self.biomass_cpd.id not in mets:   continue
+                met = mets[self.biomass_cpd.id]
+                if rxn.metabolites[met] == 1 and len(rxn.metabolites) > 1:  self.primary_biomass = rxn  ;  break
+                elif len(rxn.metabolites) == 1 and rxn.metabolites[met] < 0:  self.biomass_drain = rxn
+            else:
+                rxnComp = FBAHelper.rxn_compartment(rxn)
+                if rxnComp is None:  print(f"The reaction {rxn.id} compartment {rxnComp} is undefined.")
+                elif rxnComp[1:] == '': print("no compartment", rxn, rxnComp)
+                elif int(rxnComp[1:]) == self.index:  self.reactions.append(rxn)
 
         if self.primary_biomass is None:  print(f"No biomass reaction found for species {self.id}")
         if not self.biomass_drain:
@@ -63,9 +73,15 @@ class CommunityMember:
             self.community.util.model.add_reactions([self.biomass_drain])
             self.biomass_drain.add_metabolites({self.biomass_cpd: -1})
             self.biomass_drain.annotation["sbo"] = 'SBO:0000627'
+        # reactions = self.reactions + [self.primary_biomass, self.biomass_drain]
+        # print(Counter([rxn.id for rxn in reactions]))
+        self.model.add_reactions(self.reactions + [self.primary_biomass, self.biomass_drain])
+        self.model.add_reactions(self.community.util.exchange_list())
+        self.model.medium = self.community.util.model.medium
+        self.model.objective = self.primary_biomass.flux_expression
 
     def disable_species(self):
-        for reaction in self.community.model.reactions:
+        for reaction in self.model.reactions:
             reaction_index = FBAHelper.rxn_compartment(reaction)[1:]
             if int(reaction_index) == self.index:  reaction.upper_bound = reaction.lower_bound = 0
 
@@ -137,7 +153,7 @@ class MSCommunity:
                     if "biomass_compound" not in abundances[memID]:   print(f"The {memID} bioCPD was not captured")
 
         # print()   # this returns the carriage after the tab-ends in the biomass compound printing
-        self.members = DictList(CommunityMember(self, info["biomass_compound"], ID, index, info["abundance"])
+        self.members = DictList(CommunityMember(self, info["biomass_compound"], ID, index+1, info["abundance"])
                                 for index, (ID, info) in enumerate(abundances.items()))
         # self.members = DictList(
         #     CommunityMember(community=self, biomass_cpd=biomass_cpd, name=ids[memIndex], abundance=abundances[memIndex])
@@ -248,16 +264,15 @@ class MSCommunity:
     def atp_correction(self, core_template, atp_medias, max_gapfilling=None, gapfilling_delta=0):
         self.atp = MSATPCorrection(self.util.model, core_template, atp_medias, "c0", max_gapfilling, gapfilling_delta)
 
-
-    def _remove_regularization_constraints(self):
-        for cons in self.util.model.constraints:
-            consName = cons.name
-            if "_regularization" not in consName:  continue
-            if self.printing:   print(f"Removing {consName} from {self.util.model.id}")
-            self.util.model.remove_cons_vars(cons)
+    def _growth_fraction(self):
+        return 0.999 * exp(-0.03 * len(self.members))
 
     def regularization(self, linear=True):
-        self._remove_regularization_constraints()
+        self.util.remove_constraint("_regularization")
+        self.util.remove_constraint("min_comm_growth")
+        commMax = self.util.model.slim_optimize()
+        self.util.create_constraint(self.util.model.problem.Constraint(
+            self.primary_biomass.flux_expression, name="min_comm_growth", lb=commMax*self._growth_fraction()), printing=True)
         if linear:
             # TODO create a threshold for the absolute difference between biomasses of the community members
             for threshold in [0.1, 0.5]+list(logspace(-0, 1, 8)):  # growth differences to check
@@ -274,11 +289,14 @@ class MSCommunity:
                 if sol.status == "optimal":
                     # if self.printing:
                     print(f"The model {self.util.model.id} is regularized with a max member growth difference of {threshold}")
-                    return threshold
+                    break
         else:
             # TODO create the least-squares method employed in MICOM
             pass
-
+        commCurrent = self.util.model.slim_optimize()
+        ## TODO why are these community growths identical?
+        print(f"Max community growth ({commMax}) and after regularization ({commCurrent})")
+        return threshold
 
     # TODO evaluate the comparison of this method with MICOM
     def predict_abundances(self, media=None, pfba=True, timeout=60, environName=None, regularization=True, update_abundances=False):
@@ -293,12 +311,8 @@ class MSCommunity:
         ## maximize the sum of all member biomass reactions)
         self.set_objective(targets=[species.primary_biomass.forward_variable for species in self.members])
         self.util.model.solver.configuration.timeout = timeout
-        commMax = self.util.model.slim_optimize()
         if regularization:   threshold = self.regularization(linear=True)
         else:   self._remove_regularization_constraints()
-        commCurrent = self.util.model.slim_optimize()
-        ## TODO why are these community growths identical?
-        print(f"Max community growth ({commMax}) and after regularization ({commCurrent}) in {environName} media")
 
         # threshold = self._regularization(linear=True)
         try:    sol = self.run_fba(media, pfba)
@@ -352,21 +366,8 @@ class MSCommunity:
         return self.solution
 
     def return_member_models(self):
-        # TODO return a list of member models that is parsed from the .members attribute
-        ## which will have applicability in disaggregating community models that do not have member models
-        ## such as Filipe's Nitrate reducing community model for the SBI ENIGMA team.
-        compartments = []
-        models = []
-        for comp in compartments:
-            model = Model(f"species{comp[-1]}")
-            reactions = []
-            for rxn in self.util.model.reactions:
-                if "_"+comp in rxn.id:
-                    reactions.append(rxn)
-            model.add_reactions([])
-            models.append(model)
-        
-        return models
+        ## applicability in disaggregating Filipe's Nitrate reducing community model for the SBI ENIGMA team.
+        return [member.model for member in self.members]
 
     def add_medium(self, media):
         self.util.add_medium(media)
