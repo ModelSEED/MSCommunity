@@ -269,10 +269,10 @@ class MSCommunity:
 
     def regularization(self, linear=True):
         self.util.remove_constraint("_regularization")
-        self.util.remove_constraint("min_comm_growth")
+        # self.util.remove_constraint("min_comm_growth")
         commMax = self.util.model.slim_optimize()
-        self.util.create_constraint(self.util.model.problem.Constraint(
-            self.primary_biomass.flux_expression, name="min_comm_growth", lb=commMax*self._growth_fraction()), printing=True)
+        # self.util.create_constraint(self.util.model.problem.Constraint(
+        #     self.primary_biomass.flux_expression, name="min_comm_growth", lb=commMax*self._growth_fraction()), printing=True)
         if linear:
             # TODO create a threshold for the absolute difference between biomasses of the community members
             for threshold in [0.1, 0.5]+list(logspace(-0, 1, 8)):  # growth differences to check
