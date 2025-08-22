@@ -75,6 +75,8 @@ class CommunityMember:
             self.biomass_drain.annotation["sbo"] = 'SBO:0000627'
         # reactions = self.reactions + [self.primary_biomass, self.biomass_drain]
         # print(Counter([rxn.id for rxn in reactions]))
+        # TODO the best way of tracking the models may be to run build_from_species_models inside the MSCommunity class
+        ## where the models are available and build available.
         self.model.add_reactions(self.reactions + [self.primary_biomass, self.biomass_drain])
         self.model.add_reactions(self.community.util.exchange_list())
         self.model.medium = self.community.util.model.medium
@@ -113,7 +115,7 @@ class MSCommunity:
         self.kinCoef = kinetic_coeff
         # defining the models
         if model is None and member_models is not None:
-            model = build_from_species_models(member_models, abundances=abundances, printing=printing)
+            model, model_tracking = build_from_species_models(member_models, abundances=abundances, printing=printing)
         self.id = model.id
         self.util = MSModelUtil(model, True, None, climit, o2limit)
         self.pkgmgr = MSPackageManager.get_pkg_mgr(self.util.model)
