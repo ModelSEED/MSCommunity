@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class CommunityMember:
-    def __init__(self, community, biomass_cpd, ID=None, index=None, abundance=0):
+    def __init__(self, community, biomass_cpd, ID=None, index=None, abundance=0, model=None):
         print(ID, "biomass compound:", biomass_cpd)
         self.community, self.biomass_cpd = community, biomass_cpd
         try:     self.index = int(self.biomass_cpd.compartment[1:])
@@ -41,7 +41,8 @@ class CommunityMember:
         else:  self.id = f"Species{self.index}"
 
         logger.info(f"Making atp hydrolysis reaction for species: {self.id}")
-        self.model = Model()
+        if not model:
+            self.model = Model()
         atp_hydrolysis_rxnComp = f"c{self.index}"
         try:
             self.atp_hydrolysis = self.community.util.model.reactions.get_by_id(f"rxn00062_{atp_hydrolysis_rxnComp}")
@@ -49,10 +50,12 @@ class CommunityMember:
         except:
             atp_rxn = self.community.util.add_atp_hydrolysis(atp_hydrolysis_rxnComp)
             self.atp_hydrolysis = atp_rxn["reaction"]
-            self.model.add_reactions([self.atp_hydrolysis])
+            if not model:
+                self.model.add_reactions([self.atp_hydrolysis])
             print(f"created atp hydrolysis reaction rxn00062_{atp_hydrolysis_rxnComp} for {self.id}")
         self.biomass_drain = self.primary_biomass = None
-        self.reactions = []
+        if not model:
+            self.reactions = []
         for rxn in self.community.util.model.reactions:
             if "bio" in rxn.id:
                 mets = {met.id: met for met in rxn.metabolites}
@@ -75,6 +78,8 @@ class CommunityMember:
             self.biomass_drain.annotation["sbo"] = 'SBO:0000627'
         # reactions = self.reactions + [self.primary_biomass, self.biomass_drain]
         # print(Counter([rxn.id for rxn in reactions]))
+        # TODO the best way of tracking the models may be to run build_from_species_models inside the MSCommunity class
+        ## where the models are available and build available.
         self.model.add_reactions(self.reactions + [self.primary_biomass, self.biomass_drain])
         self.model.add_reactions(self.community.util.exchange_list())
         self.model.medium = self.community.util.model.medium
@@ -113,7 +118,7 @@ class MSCommunity:
         self.kinCoef = kinetic_coeff
         # defining the models
         if model is None and member_models is not None:
-            model = build_from_species_models(member_models, abundances=abundances, printing=printing)
+            model, model_tracking = build_from_species_models(member_models, abundances=abundances, printing=printing)
         self.id = model.id
         self.util = MSModelUtil(model, True, None, climit, o2limit)
         self.pkgmgr = MSPackageManager.get_pkg_mgr(self.util.model)
@@ -364,6 +369,11 @@ class MSCommunity:
         self.util.model.objective = ogObj
         self.util.model.medium = ogMedia
         return self._compute_relative_abundance_from_solution(sol, True, update_abundances)
+    
+    def micom():
+        # define 
+        
+        pass
 
     def run_fba(self, media=None, pfba=False, fva_reactions=None):
         print("pfba =", pfba)

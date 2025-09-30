@@ -67,7 +67,9 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     new_metabolites, new_reactions = set(), set()
     member_biomasses = {}
     models = models if not abundances else [mdl for mdl in models if mdl.id in abundances]
+    model_tracking = {}
     for model_index, org_model in enumerate(models):
+        model_tracking[model_index] = org_model.id
         model_util = MSModelUtil(org_model, copy=copy_models, climit=False, o2limit=False)
         model_reaction_ids = [rxn.id for rxn in model_util.model.reactions]
         model_index += 1
@@ -183,8 +185,8 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     if hasattr(newutl.model, "_context"):  newutl.model._contents.append(member_biomasses)
     elif hasattr(newutl.model, "notes"):  newutl.model.notes.update({"member_biomass_cpds": member_biomasses})
     # print([cons.name for cons in newutl.model.constraints])
-    if MSmodel:   return newutl
-    return newutl.model
+    if MSmodel:   return newutl, model_tracking
+    return newutl.model, model_tracking
 
 
 def phenotypes(community_members, phenotype_flux_threshold=.1, solver:str="glpk"):
