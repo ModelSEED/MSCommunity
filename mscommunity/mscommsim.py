@@ -182,8 +182,9 @@ class MSCommunity:
         self.primary_biomass.add_metabolites(all_metabolites, combine=False)
         self.abundances_set = True
 
-    def set_objective(self, target=None, targets=None, minimize=False):
+    def set_objective(self, target=None, targets=None, weights=None, minimize=False):
         targets = targets or [self.util.model.reactions.get_by_id(target or self.primary_biomass.id).flux_expression]
+        if weights is not None:   targets = [t*w for t, w in zip(targets, weights)]
         self.util.model.objective = self.util.model.problem.Objective(sum(targets), direction="max" if not minimize else "min")
 
     def constrain(self, element_uptake_limit=None, thermo_params=None, msdb_path=None):
@@ -265,14 +266,18 @@ class MSCommunity:
         self.atp = MSATPCorrection(self.util.model, core_template, atp_medias, "c0", max_gapfilling, gapfilling_delta)
 
     def _growth_fraction(self):
-        return 0.999 * exp(-0.03 * len(self.members))
+        growth_multiple = 0.999 * exp(-0.03 * len(self.members))
+        if self.printing:  print(f"The growth multiple is {growth_multiple}")
+        return growth_multiple
 
-    def regularization(self, linear=True):
+    def regularization(self, linear=True, growth_constraint=True):
         self.util.remove_constraint("_regularization")
         # self.util.remove_constraint("min_comm_growth")
         commMax = self.util.model.slim_optimize()
-        # self.util.create_constraint(self.util.model.problem.Constraint(
-        #     self.primary_biomass.flux_expression, name="min_comm_growth", lb=commMax*self._growth_fraction()), printing=True)
+        if growth_constraint:
+            self.util.remove_constraint("min_comm_growth")
+            self.util.create_constraint(self.util.model.problem.Constraint(
+                self.primary_biomass.flux_expression, name="min_comm_growth", lb=commMax*self._growth_fraction()), printing=True)
         if linear:
             # TODO create a threshold for the absolute difference between biomasses of the community members
             for threshold in [0.1, 0.5]+list(logspace(-0, 1, 8)):  # growth differences to check
@@ -298,8 +303,43 @@ class MSCommunity:
         print(f"Max community growth ({commMax}) and after regularization ({commCurrent})")
         return threshold
 
+    def micom(self, media, tradeoff=0.6):
+        media = [media] if type(media) == dict else media
+        self.util.model.solver = "hybrid"
+        solutions = []
+        for m in media:
+            # add the objectives
+            if self.abundances is None:
+                self.predict_abundances()
+            # obj = sum([mem.primary_biomass.forward_variable*mem.abundance for mem in self.members])
+            obj = self.primary_biomass.forward_variable
+            self.util.model.objective = self.util.model.problem.Objective(obj, direction="max")
+            ## maximize the community growth
+            sol = self.run_fba(m, pfba=False)
+            ### set tradeoff
+            biomass = sol.fluxes[self.primary_biomass.id]
+            # biomass = sum([sol.fluxes[mem.primary_biomass.id]*mem.abundance for mem in self.members])
+            tradeoff_growth = biomass*tradeoff
+            print(biomass, tradeoff)
+            self.util.remove_constraint("comm_tradeoff")
+            self.util.create_constraint(self.util.model.problem.Constraint(
+                self.primary_biomass.forward_variable, name="comm_tradeoff",
+                ub=None, lb=tradeoff_growth), printing=True)
+            ## minimize the sum of the absolute differences between the member growths
+            obj = sum([mem.primary_biomass.forward_variable**2 for mem in self.members])
+            self.util.model.objective = self.util.model.problem.Objective(obj, direction="min")
+            sol = self.run_fba(m, pfba=False)
+            # TODO hard-code a subsequent pFBA optimization that fixes biomasses of all members 
+            solutions.append(sol)
+        return solutions
+
+
+        
+
     # TODO evaluate the comparison of this method with MICOM
-    def predict_abundances(self, media=None, pfba=True, timeout=60, environName=None, regularization=True, update_abundances=False):
+    # TODO implement a community tradeoff and then the objective should be a fraction of the total summed biomass with a minimization of variance
+    def predict_abundances(self, media=None, pfba=True, timeout=60,
+                           environName=None, regularization=True, update_abundances=False):
         slimOpt = self.util.model.slim_optimize()
         if isclose(0, slimOpt, abs_tol=1e-3):
             print(f"The model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt} in {environName} media")
@@ -312,7 +352,7 @@ class MSCommunity:
         self.set_objective(targets=[species.primary_biomass.forward_variable for species in self.members])
         self.util.model.solver.configuration.timeout = timeout
         if regularization:   threshold = self.regularization(linear=True)
-        else:   self._remove_regularization_constraints()
+        else:   self.util.remove_constraint("_regularization")
 
         # threshold = self._regularization(linear=True)
         try:    sol = self.run_fba(media, pfba)
@@ -349,7 +389,7 @@ class MSCommunity:
         if solution.status != "optimal":
             FeasibilityError(f'The solution is sub-optimal, with a(n) {solution} status.')
             self.solution = None
-            self.print_lp()
+            self.print_lp("erronous_model.lp")
             save_matlab_model(self.util.model, self.util.model.name + ".mat")
         self.solution = solution
         self.member_fluxes, self.memGrowths = {}, {}
