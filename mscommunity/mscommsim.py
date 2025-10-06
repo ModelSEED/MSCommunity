@@ -376,7 +376,7 @@ class MSCommunity:
         pass
 
     def run_fba(self, media=None, pfba=False, fva_reactions=None):
-        print("pfba =", pfba)
+        # print("pfba =", pfba)
         if media is not None:  self.util.add_medium(media)
         return self._set_solution(self.util.run_fba(None, pfba, fva_reactions))
 
