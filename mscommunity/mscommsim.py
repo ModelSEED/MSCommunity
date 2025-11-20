@@ -18,13 +18,14 @@ from cobra import Reaction, Model
 from numpy import array, logspace
 from os import makedirs, path
 from math import isclose
+from icecream import ic
 from pandas import DataFrame
 from pprint import pprint
 from math import exp
 import logging
 
 logger = logging.getLogger(__name__)
-
+ic.configureOutput(includeContext=True)
 
 class CommunityMember:
     def __init__(self, community, biomass_cpd, ID=None, index=None, abundance=0, model=None):
@@ -105,7 +106,7 @@ class CommunityMember:
 
 class MSCommunity:
     def __init__(self, model=None, member_models: list = None, abundances=None, ids=None, kinetic_coeff=750,
-                 flux_limit=300, probs={}, climit=None, o2limit=None, lp_filename=None, printing=False):
+                 flux_limit=300, probs={}, climit=None, o2limit=None, lp_filename=None, printing=False, eleLimits=None):
         assert model is not None or member_models is not None, "Either the community model and the member models must be defined."
         self.lp_filename = lp_filename
         self.printing = printing
@@ -113,7 +114,7 @@ class MSCommunity:
 
         #Define Data attributes as None
         for attr in ['solution', 'biomass_cpd', 'primary_biomass', 'biomass_drain', 'threshold', 'msgapfill', 
-                     'element_uptake_limit', 'msdb_path', 'comm_growth', 'threshold']:
+                     'element_uptake_limit', 'msdb_path', 'comm_growth', 'threshold', "memGrowths", "member_fluxes"]:
             setattr(self, attr, None)
         self.kinCoef = kinetic_coeff
         # defining the models
@@ -169,6 +170,8 @@ class MSCommunity:
         # assign the MSCommunity constraints and objective
         self.rxnProbs = probs
         self.pkgmgr.getpkg("CommKineticPkg").build_package(kinetic_coeff, self, self.rxnProbs)
+        if eleLimits is not None:
+            self.pkgmgr.getpkg("ElementUptakePkg").build_package(eleLimits)
         # if kinetic_coeff is not None:   self.add_commkinetics(kinetic_coeff, probs)
         
 
@@ -305,7 +308,7 @@ class MSCommunity:
             pass
         commCurrent = self.util.model.slim_optimize()
         ## TODO why are these community growths identical?
-        print(f"Max community growth ({commMax}) and after regularization ({commCurrent})")
+        ic(f"Max community growth ({commMax}) and after regularization ({commCurrent})")
         return threshold
 
     def micom(self, media, tradeoff=0.6):
@@ -325,7 +328,7 @@ class MSCommunity:
             biomass = sol.fluxes[self.primary_biomass.id]
             # biomass = sum([sol.fluxes[mem.primary_biomass.id]*mem.abundance for mem in self.members])
             tradeoff_growth = biomass*tradeoff
-            print(biomass, tradeoff)
+            ic(biomass, tradeoff)
             self.util.remove_constraint("comm_tradeoff")
             self.util.create_constraint(self.util.model.problem.Constraint(
                 self.primary_biomass.forward_variable, name="comm_tradeoff",
@@ -339,15 +342,14 @@ class MSCommunity:
         return solutions
 
 
-        
-
     # TODO evaluate the comparison of this method with MICOM
     # TODO implement a community tradeoff and then the objective should be a fraction of the total summed biomass with a minimization of variance
     def predict_abundances(self, media=None, pfba=True, timeout=60,
                            environName=None, regularization=True, update_abundances=False):
+        print("regularization", regularization)
         slimOpt = self.util.model.slim_optimize()
         if isclose(0, slimOpt, abs_tol=1e-3):
-            print(f"The model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt} in {environName} media")
+            print(f"\nThe model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt} in {environName} media")
         # store the original parameters
         ogObj = self.util.model.objective
         ogMedia = self.util.model.medium
@@ -369,30 +371,34 @@ class MSCommunity:
         self.util.model.objective = ogObj
         self.util.model.medium = ogMedia
         return self._compute_relative_abundance_from_solution(sol, True, update_abundances)
-    
-    def micom():
-        # define 
-        
-        pass
 
     def run_fba(self, media=None, pfba=False, fva_reactions=None):
         # print("pfba =", pfba)
         if media is not None:  self.util.add_medium(media)
         return self._set_solution(self.util.run_fba(None, pfba, fva_reactions))
 
+    def _comm_growth(self):
+        self.comm_growth = 0
+        self.member_fluxes, self.memGrowths = {}, {}
+        for mem in self.members:
+            self.member_fluxes[mem.id] = array([self.solution.fluxes[rxn.id] for rxn in mem.reactions])
+            self.memGrowths[mem.id] = self.solution.fluxes[mem.primary_biomass.id]
+            self.comm_growth += self.memGrowths[mem.id] * mem.abundance
+
     def _compute_relative_abundance_from_solution(self, solution=None, skipNoGrowth=True, update_abundances=False):
-        solution = solution or self.solution
-        total_growth = sum([solution.fluxes[member.primary_biomass.id] for member in self.members])
+        if solution is not None:  self._set_solution(solution)
+        total_growth = sum([self.solution.fluxes[member.primary_biomass.id] for member in self.members])
         message = f"The total community growth is {total_growth}"
-        if self.printing:  print(message)
+        if self.printing:  ic(message)
         if isclose(0, total_growth, abs_tol=1e-3):
             if not skipNoGrowth:   NoFluxError(f"No community growth: {total_growth} in {self.util.model.id}")
             else:    print(message)  ;  return None
-        abundances = {member.id: solution.fluxes[member.primary_biomass.id]/total_growth for member in self.members}
+        abundances = {member.id: self.solution.fluxes[member.primary_biomass.id]/total_growth for member in self.members}
         if update_abundances:
             self.set_abundance(abundances)
             if self.printing:  print(f"Updated abundances: {self.abundances}")
-        self.comm_growth = sum([solution.fluxes[mem.primary_biomass.id]*mem.abundance for mem in self.members])
+        for mem in self.members:
+            ic(f"{mem.id} grows {self.solution.fluxes[mem.primary_biomass.id]} with abundance {mem.abundance}")
         return abundances
 
     def _set_solution(self, solution):
@@ -402,16 +408,12 @@ class MSCommunity:
             self.print_lp("erronous_model.lp")
             save_matlab_model(self.util.model, self.util.model.name + ".mat")
         self.solution = solution
-        self.member_fluxes, self.memGrowths = {}, {}
-        self.comm_growth = 0
-        for mem in self.members:
-            self.member_fluxes[mem.id] = array([solution.fluxes[rxn.id] for rxn in mem.reactions])
-            self.memGrowths[mem.id] = self.solution.fluxes[mem.primary_biomass.id]
-            self.comm_growth += self.memGrowths[mem.id] * mem.abundance
+        self.exchange_fluxes = {ex.id: self.solution.fluxes[ex.id] for ex in self.util.model.reactions if "EX_" in ex.id}
+        self._comm_growth()
         if self.printing:
-            print("Member Biomass Fluxes:", self.memGrowths)  # TODO weight the member growths by their abundances
-            print("Max member Fluxes:", {memID: growth*self.kinCoef for memID, growth in self.memGrowths.items()})
-            print("Total fluxes:", {memID: sum(abs(fluxes)) for memID, fluxes in self.member_fluxes.items()})
+            ic("Member Biomass Fluxes:", self.memGrowths)  # TODO weight the member growths by their abundances
+            ic("Max member Fluxes:", {memID: growth*self.kinCoef for memID, growth in self.memGrowths.items()})
+            ic("Total fluxes:", {memID: sum(abs(fluxes)) for memID, fluxes in self.member_fluxes.items()})
         # logger.info(self.util.model.summary())
         return self.solution
 
