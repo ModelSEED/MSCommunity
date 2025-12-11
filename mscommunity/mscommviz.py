@@ -1,6 +1,6 @@
 from icecream import ic
 
-from modelseedpy import FBAHelper
+from modelseedpy.core.fbahelper import FBAHelper
 from modelseedpy.biochem import from_local
 from modelseedpy.core.exceptions import ObjectAlreadyDefinedError, ParameterError, NoFluxError
 # from modelseedpy.community.commhelper import build_from_species_models, CommHelper
