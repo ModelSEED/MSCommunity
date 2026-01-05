@@ -67,7 +67,7 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     new_metabolites, new_reactions = set(), set()
     member_biomasses = {}
     models = models if not abundances else [mdl for mdl in models if mdl.id in abundances]
-    print(models)
+    # print(models)
     model_tracking = {}
     if printing: print(len(models), "models are being processed")
     for model_index, org_model in enumerate(models):
@@ -167,7 +167,7 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     comm_biomass = Metabolite("cpd11416_c0", None, "Community biomass", 0, "c0")
     metabolites = {comm_biomass: 1}
     ## constrain the community abundances
-    print(len(member_biomasses), "member biomasses will merge into the community biomass", member_biomasses)
+    # print(len(member_biomasses), "member biomasses will merge into the community biomass", member_biomasses)
     if abundances:
         oneDeep = list(abundances.values())[0]
         if isinstance(oneDeep, dict):
@@ -175,7 +175,7 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
             abundances = {met: -abundances[memberID]["abundance"] for memberID, met in member_biomasses.items()}
         elif isinstance(oneDeep, float): abundances = {met: -abundances[memberID]/len(mets)
                                                        for memberID, mets in member_biomasses.items() for met in mets}
-    else:  abundances = {met: -1 / len(member_biomasses) for met in member_biomasses.values()}
+    else:  abundances = {met: -1 / len(member_biomasses) for mets in member_biomasses.values() for met in mets}
 
     ##TODO - add the biomass reactions instead of the biomass metabolites for the commKinetics
 
