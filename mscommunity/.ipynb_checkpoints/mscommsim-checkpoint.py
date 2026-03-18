@@ -106,7 +106,7 @@ class CommunityMember:
 
 class MSCommunity:
     def __init__(self, model=None, member_models: list = None, abundances=None, ids=None, kinetic_coeff=750,
-                 flux_limit=300, probs={}, climit=None, o2limit=None, lp_filename=None, printing=False, eleLimits=None):
+                 flux_limit=300, probs={}, climit=None, o2limit=None, lp_filename=None, printing=False, eleLimits=None, ID=None):
         assert model is not None or member_models is not None, "Either the community model and the member models must be defined."
         self.lp_filename = lp_filename
         self.printing = printing
@@ -119,8 +119,9 @@ class MSCommunity:
         self.kinCoef = kinetic_coeff
         # defining the models
         if model is None and member_models is not None:
-            model, model_tracking = build_from_species_models(member_models, abundances=abundances, printing=printing)
-        self.id = model.id
+            model = build_from_species_models(member_models, abundances=abundances, printing=printing)
+        self.id = ID or model.id
+        # self.modelID_names = model.notes["modelID_names"]
         self.util = MSModelUtil(model, True, None, climit, o2limit)
         self.pkgmgr = MSPackageManager.get_pkg_mgr(self.util.model)
         msid_cobraid_hash = self.util.msid_hash()  # dict of list() of metabolite objects by their msid
@@ -143,6 +144,7 @@ class MSCommunity:
         if ids is None:
             if member_models is not None:   ids = [mem.id for mem in member_models]
             else:  ids = [f"Species{i}" for i in range(len(other_biomass_cpds))]
+        # memberIDs_biomass = dict(zip(ids,
         if not abundances:
             if member_models is None:
                 abundances = {ids[memIndex]: {"biomass_compound": bioCpd, "abundance": 1/len(other_biomass_cpds)}
@@ -157,6 +159,9 @@ class MSCommunity:
                             abundances[memID].update({"biomass_compound": met})
                             # print(bioCPD, met.id)
                     if "biomass_compound" not in abundances[memID]:   print(f"The {memID} bioCPD was not captured")
+        elif "abundance" not in list(abundances.values())[0]:
+            abundances = {memID:{"abundance": abund, "biomass_compound": model.notes["member_biomass_cpds"][memID]}
+                            for memID, abund in abundances.items()}
 
         # print()   # this returns the carriage after the tab-ends in the biomass compound printing
         self.members = DictList(CommunityMember(self, info["biomass_compound"], ID, index+1, info["abundance"])
