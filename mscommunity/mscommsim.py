@@ -122,7 +122,6 @@ class MSCommunity:
             model, model_tracking = build_from_species_models(member_models, abundances=abundances, printing=printing)
         self.id = model.id
         self.util = MSModelUtil(model, True, None, climit, o2limit)
-        self.pkgmgr = MSPackageManager.get_pkg_mgr(self.util.model)
         msid_cobraid_hash = self.util.msid_hash()  # dict of list() of metabolite objects by their msid
         if "cpd11416" not in msid_cobraid_hash:  raise KeyError("Could not find biomass compound for the model.")
         other_biomass_cpds = []
@@ -166,9 +165,9 @@ class MSCommunity:
         #     for memIndex, biomass_cpd in enumerate(other_biomass_cpds))
         self.set_abundance(abundances)
 
-        
         # assign the MSCommunity constraints and objective
         self.rxnProbs = probs
+        self.pkgmgr = MSPackageManager.get_pkg_mgr(self.util.model)
         self.pkgmgr.getpkg("CommKineticPkg").build_package(kinetic_coeff, self, self.rxnProbs)
         if eleLimits is not None:
             self.pkgmgr.getpkg("ElementUptakePkg").build_package(eleLimits)
