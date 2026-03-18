@@ -67,15 +67,18 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     new_metabolites, new_reactions = set(), set()
     member_biomasses = {}
     models = models if not abundances else [mdl for mdl in models if mdl.id in abundances]
+    # print(models)
     model_tracking = {}
+    if printing: print(len(models), "models are being processed")
     for model_index, org_model in enumerate(models):
-        model_tracking[model_index] = org_model.id
-        model_util = MSModelUtil(org_model, copy=copy_models, climit=False, o2limit=False)
-        model_reaction_ids = [rxn.id for rxn in model_util.model.reactions]
         model_index += 1
+        model_tracking[model_index] = {"ID": org_model.id, "biomassIDs": []}
+        # model_util = MSModelUtil(org_model, copy=copy_models, climit=False, o2limit=False)
+        model_reaction_ids = [rxn.id for rxn in org_model.reactions]
         # if MSmodel:
         # Rename metabolites
-        for met in model_util.model.metabolites:
+        if printing: print(len(org_model.metabolites), "metabolites of", org_model.id, "are being processed")
+        for met in org_model.metabolites: #model_util.model.metabolites:
             # Renaming compartments
             output = MSModelUtil.parse_id(met)
             # if printing:  print(met, output)
@@ -95,58 +98,66 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
                     met.id = name + "_" + met.compartment
             new_metabolites.add(met)
             if "cpd11416_c" in met.id or "biomass" in met.name or "biomass" in met.id:
-                met.name = f"{met.id}_{model_util.model.id}"
-                member_biomasses[org_model.id] = met
+                met.name = f"{met.id}_{org_model.id}"
+                member_biomasses.setdefault(org_model.id, []).append(met)
+                if printing: print(org_model.id, "biomass metabolite captured", met.id)
         # Rename reactions
-        for rxn in model_util.model.reactions:  # !!! all reactions should have a non-zero compartment index
-            if rxn.id[0:3] != "EX_":
-                ## biomass reactions
-                if re.search('^(bio)(\d+)$', rxn.id) or "biomass" in rxn.id:
-                    print(rxn.id, "from", model_util.id, "becomes", end=" ")
-                    index = int(re.sub(r"(^biomass)", "", rxn.id)) if "biomass" in rxn.id else int(re.sub(r"(^bio)", "", rxn.id))
-                    if biomass_index == 2:
-                        while f"bio{biomass_index}" in model_reaction_ids:  biomass_index += 1
-                    if index not in biomass_indices and index >= minimal_biomass_index: biomass_indices.append(index)
-                    elif f"bio{biomass_index}" not in model_reaction_ids:  biomass_indices.append(biomass_index)
-                    elif f"bio{minimal_biomass_index}" not in model_reaction_ids:  biomass_indices.append(minimal_biomass_index)
-                    else:
-                        logger.error("The biomass reaction is not properly defined.")
-                        index = minimal_biomass_index
-                        while f"bio{index}" not in model_reaction_ids and index not in biomass_indices:
-                            index += 1
-                        biomass_indices.append(index)
-                    rxn.id = f"bio{biomass_indices[-1]}"
-                    model_reaction_ids.append(rxn.id)
-                    biomass_index += 1
-                    print(rxn.id)
-                ## non-biomass reactions
+        if printing: print(len(org_model.reactions), "reactions of", org_model.id, "are being processed")
+        for rxn in org_model.reactions: #model_util.model.reactions:
+            if rxn.id[0:3] == "EX_":
+                new_reactions.add(rxn)
+                continue
+            ## biomass reactions
+            if re.search('^(bio)(\d+)$', rxn.id) or "biomass" in rxn.id:
+                print(rxn.id, "from", org_model.id, "becomes", end=" ")
+                index = int(re.sub(r"(^biomass)", "", rxn.id)) if "biomass" in rxn.id else int(re.sub(r"(^bio)", "", rxn.id))
+                if biomass_index == 2:
+                    while f"bio{biomass_index}" in model_reaction_ids:  biomass_index += 1
+                ### keeps original index if possible
+                if index not in biomass_indices and index >= minimal_biomass_index: biomass_indices.append(index)
+                ### assigns the biomass_index
+                elif f"bio{biomass_index}" not in model_reaction_ids:  biomass_indices.append(biomass_index)
+                ### 
+                # elif f"bio{minimal_biomass_index}" not in model_reaction_ids:  biomass_indices.append(minimal_biomass_index)
                 else:
-                    initialID = str(rxn.id)
-                    output = MSModelUtil.parse_id(rxn)
-                    if output is None:
-                        if printing:  print(f"The {rxn.id} ({output}; {hasattr(rxn, 'compartment')}) is unpredictable.")
-                        try:
-                            rxn.id = correct_nonMSID(rxn, (rxn.id, "c"), model_index)
-                            output = MSModelUtil.parse_id(rxn)
-                        except ValueError:  pass
-                    elif len(output) == 2:
-                        rxn.id = correct_nonMSID(rxn, output, model_index)
-                        if printing:  print(f"{output} from {rxn.id}")
+                    # logger.error("The biomass reaction is not properly defined.")
+                    index = minimal_biomass_index
+                    while f"bio{index}" not in model_reaction_ids and index not in biomass_indices:
+                        index += 1
+                    biomass_indices.append(index)
+                rxn.id = f"bio{biomass_indices[-1]}"
+                model_reaction_ids.append(rxn.id)
+                model_tracking[model_index]["biomassIDs"].append(rxn.id)
+                biomass_index += 1
+                print(rxn.id)
+            ## non-biomass reactions
+            else:
+                initialID = str(rxn.id)
+                output = MSModelUtil.parse_id(rxn)
+                if output is None:
+                    if printing:  print(f"The {rxn.id} ({output}; {hasattr(rxn, 'compartment')}) is unpredictable.")
+                    try:
+                        rxn.id = correct_nonMSID(rxn, (rxn.id, "c"), model_index)
                         output = MSModelUtil.parse_id(rxn)
-                    if len(output) == 3:
-                        name, compartment, index = output
-                        if compartment != "e":
-                            rxn.name = f"{name}_{compartment}{model_index}"
-                            rxn_id = re.search(r"(.+\_\w)(?=\d+)", rxn.id).group()
-                            if index == "":  rxn.id += str(model_index)
-                            else:  rxn.id = rxn_id + str(model_index)
-                    finalID = str(rxn.id)
-                    string_diff = ""
-                    for index, let in enumerate(finalID):
-                        if index >= len(initialID) or index < len(initialID) and let != initialID[index]: string_diff += let
-                    # if "compartment" not in locals():  print(f"the {rxn.id} with a {output} output is not defined with a compartment.")
-                    if string_diff != f"_{compartment}{model_index}" or not FBAHelper.isnumber(string_diff) and printing:
-                        logger.debug(f"The ID {initialID} is changed with {string_diff} to create the final ID {finalID}")
+                    except ValueError:  pass
+                elif len(output) == 2:
+                    rxn.id = correct_nonMSID(rxn, output, model_index)
+                    if printing:  print(f"{output} from {rxn.id}")
+                    output = MSModelUtil.parse_id(rxn)
+                if len(output) == 3:
+                    name, compartment, index = output
+                    if compartment != "e":
+                        rxn.name = f"{name}_{compartment}{model_index}"
+                        rxn_id = re.search(r"(.+\_\w)(?=\d+)", rxn.id).group()
+                        if index == "":  rxn.id += str(model_index)
+                        else:  rxn.id = rxn_id + str(model_index)
+                finalID = str(rxn.id)
+                string_diff = ""
+                for index, let in enumerate(finalID):
+                    if index >= len(initialID) or index < len(initialID) and let != initialID[index]: string_diff += let
+                # if "compartment" not in locals():  print(f"the {rxn.id} with a {output} output is not defined with a compartment.")
+                if string_diff != f"_{compartment}{model_index}" or not FBAHelper.isnumber(string_diff) and printing:
+                    logger.debug(f"The ID {initialID} is changed with {string_diff} to create the final ID {finalID}")
             new_reactions.add(rxn)
         # else:
         #     # TODO develop a method for compartmentalizing models without editing all reaction IDs or assuming their syntax
@@ -156,13 +167,17 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     comm_biomass = Metabolite("cpd11416_c0", None, "Community biomass", 0, "c0")
     metabolites = {comm_biomass: 1}
     ## constrain the community abundances
+    # print(len(member_biomasses), "member biomasses will merge into the community biomass", member_biomasses)
     if abundances:
-        if isinstance(abundances[list(abundances.keys())[0]], dict):
+        oneDeep = list(abundances.values())[0]
+        if isinstance(oneDeep, dict):
+            # if isinstance(list(oneDeep.values())[0], dict):
             abundances = {met: -abundances[memberID]["abundance"] for memberID, met in member_biomasses.items()}
-        else:   abundances = {met: -abundances[memberID]["abundance"] for memberID, met in member_biomasses.items()}
-    else:  abundances = {met: -1 / len(member_biomasses) for met in member_biomasses.values()}
+        elif isinstance(oneDeep, float): abundances = {met: -abundances[memberID]/len(mets)
+                                                       for memberID, mets in member_biomasses.items() for met in mets}
+    else:  abundances = {met: -1 / len(member_biomasses) for mets in member_biomasses.values() for met in mets}
 
-    ## TODO - add the biomass reactions instead of the biomass metabolites for the commKinetics
+    ##TODO - add the biomass reactions instead of the biomass metabolites for the commKinetics
 
     ## define community biomass components
     metabolites.update(abundances)
@@ -171,22 +186,22 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
 
     # adds only unique reactions and metabolites to the community model
     newmodel = Model(model_id or "+".join([model.id for model in models]),
-                     name or "+".join([model.name for model in models]))
+                     name or " + ".join([model.name for model in models]))
     newmodel.add_reactions(FBAHelper.filter_cobra_set(new_reactions))
     newmodel.add_metabolites(FBAHelper.filter_cobra_set(new_metabolites))
     newmodel.add_reactions([comm_biorxn])
-    newmodel.objective = Objective(comm_biorxn.flux_expression)
     newutl = MSModelUtil(newmodel, False, climit=climit, o2limit=o2limit)
-    # newutl.add_objective(comm_biorxn.flux_expression)
+    newutl.add_objective(comm_biorxn.flux_expression)
     newutl.model.add_boundary(comm_biomass, "sink") # Is a sink reaction for reversible cpd11416_c0 consumption necessary?
-    ## proportionally limit the fluxes to their abundances
+    ##TODO proportionally limit the fluxes to their abundances
     # add the metadata of community composition
     print("Community objective", newutl.model.objective.expression)
     if hasattr(newutl.model, "_context"):  newutl.model._contents.append(member_biomasses)
-    elif hasattr(newutl.model, "notes"):  newutl.model.notes.update({"member_biomass_cpds": member_biomasses})
+    elif hasattr(newutl.model, "notes"):
+        newutl.model.notes.update({"member_biomass_cpds": member_biomasses, "modelIndex_names": model_tracking})
     # print([cons.name for cons in newutl.model.constraints])
-    if MSmodel:   return newutl, model_tracking
-    return newutl.model, model_tracking
+    if MSmodel:   return newutl
+    return newutl.model
 
 
 def phenotypes(community_members, phenotype_flux_threshold=.1, solver:str="glpk"):
