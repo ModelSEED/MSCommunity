@@ -82,7 +82,7 @@ class CommunityMember:
         # TODO the best way of tracking the models may be to run build_from_species_models inside the MSCommunity class
         ## where the models are available and build available.
         self.model.add_reactions(self.reactions + [self.primary_biomass, self.biomass_drain])
-        self.model.add_reactions(self.community.util.exchange_list())
+        self.model.add_reactions([rxn.copy() for rxn in self.community.util.exchange_list()])
         self.model.medium = self.community.util.model.medium
         self.model.objective = self.primary_biomass.flux_expression
 
@@ -378,7 +378,8 @@ class MSCommunity:
 
     def run_fba(self, media=None, pfba=False, fva_reactions=None):
         # print("pfba =", pfba)
-        if media is not None:  self.util.add_medium(media)
+        if media is not None:
+            self.util.add_medium(media)
         return self._set_solution(self.util.run_fba(None, pfba, fva_reactions))
 
     def _comm_growth(self):

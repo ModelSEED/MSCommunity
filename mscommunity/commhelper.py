@@ -60,7 +60,7 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     ------
     """
     # construct the new model
-    models = org_models #if not standardize else GEMCompatibility.standardize(
+    models = [mdl.copy() for mdl in org_models] #if not standardize else GEMCompatibility.standardize(
         #org_models, exchanges=True, conflicts_file_name='exchanges_conflicts.json')
     biomass_indices = []
     biomass_index = minimal_biomass_index = 2
