@@ -15,9 +15,9 @@ from collections import Counter
 from optlang.symbolics import Zero
 from cobra.flux_analysis import pfba
 from cobra import Reaction, Model
-from numpy import array, logspace
+from numpy import array, logspace, linspace
 from os import makedirs, path
-from math import isclose
+from math import isclose, isnan
 from icecream import ic
 from pandas import DataFrame
 from pprint import pprint
@@ -52,7 +52,7 @@ class CommunityMember:
             atp_rxn = self.community.util.add_atp_hydrolysis(atp_hydrolysis_rxnComp)
             self.atp_hydrolysis = atp_rxn["reaction"]
             if not model:
-                self.model.add_reactions([self.atp_hydrolysis])
+                self.model.add_reactions([self.atp_hydrolysis.copy()])
             print(f"created atp hydrolysis reaction rxn00062_{atp_hydrolysis_rxnComp} for {self.id}")
         self.biomass_drain = self.primary_biomass = None
         if not model:
@@ -81,13 +81,13 @@ class CommunityMember:
         # print(Counter([rxn.id for rxn in reactions]))
         # TODO the best way of tracking the models may be to run build_from_species_models inside the MSCommunity class
         ## where the models are available and build available.
-        self.model.add_reactions(self.reactions + [self.primary_biomass, self.biomass_drain])
+        self.model.add_reactions([rxn.copy() for rxn in self.reactions + [self.primary_biomass, self.biomass_drain]])
         self.model.add_reactions([rxn.copy() for rxn in self.community.util.exchange_list()])
         self.model.medium = self.community.util.model.medium
-        self.model.objective = self.primary_biomass.flux_expression
+        self.model.objective = self.model.reactions.get_by_id(self.primary_biomass.id).flux_expression
 
     def disable_species(self):
-        for reaction in self.model.reactions:
+        for reaction in self.community.util.model.reactions:
             reaction_index = FBAHelper.rxn_compartment(reaction)[1:]
             if int(reaction_index) == self.index:  reaction.upper_bound = reaction.lower_bound = 0
 
@@ -288,30 +288,24 @@ class MSCommunity:
         commMax = self.util.model.slim_optimize()
         if growth_constraint:
             self.util.remove_constraint("min_comm_growth")
-            self.util.create_constraint(self.util.model.problem.Constraint(
-                self.primary_biomass.flux_expression, name="min_comm_growth", lb=commMax*self._growth_fraction()), printing=True)
+            if commMax is not None and not isnan(commMax) and commMax > 1e-6:
+                self.util.create_constraint(self.util.model.problem.Constraint(
+                    self.primary_biomass.flux_expression, name="min_comm_growth", lb=commMax*self._growth_fraction()), printing=True)
         if linear:
-            # TODO create a threshold for the absolute difference between biomasses of the community members
-            for threshold in [0.1, 0.5]+list(logspace(-0, 1, 8)):  # growth differences to check
+            for threshold in [f * commMax for f in list(linspace(0.3, 0.5, 5)) + list(linspace(0.6, 1.0, 5))]:
                 for mem1, mem2 in permutations(self.members, 2):
                     ## mu_i - mu_j <= threshold   &   mu_j - mu_i <= threshold
                     consName = f"{mem1.id}_{mem2.id}_regularization"
-                    # if consName in self.util.model.constraints:
-                    #     print(f"Removing {consName} from {self.util.model.id}")
-                    #     self.util.model.remove_cons_vars(self.util.model.constraints[consName])
                     coef = {mem1.primary_biomass.forward_variable: 1, mem2.primary_biomass.forward_variable: -1}
                     self.util.create_constraint(self.util.model.problem.Constraint(Zero, name=consName, ub=threshold), coef=coef, printing=True)
-                # print()
                 sol = self.util.model.optimize()
                 if sol.status == "optimal":
-                    # if self.printing:
                     print(f"The model {self.util.model.id} is regularized with a max member growth difference of {threshold}")
                     break
         else:
             # TODO create the least-squares method employed in MICOM
             pass
         commCurrent = self.util.model.slim_optimize()
-        ## TODO why are these community growths identical?
         ic(f"Max community growth ({commMax}) and after regularization ({commCurrent})")
         return threshold
 
@@ -351,13 +345,16 @@ class MSCommunity:
     def predict_abundances(self, media=None, pfba=True, timeout=60,
                            environName=None, regularization=True, update_abundances=False):
         print("regularization", regularization)
-        slimOpt = self.util.model.slim_optimize()
-        if isclose(0, slimOpt, abs_tol=1e-3):
-            print(f"\nThe model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt} in {environName} media")
         # store the original parameters
         ogObj = self.util.model.objective
         ogMedia = self.util.model.medium
         ogTimeout = self.util.model.solver.configuration.timeout
+        # apply environment media BEFORE regularization so constraints are calibrated correctly
+        if media is not None:
+            self.util.add_medium(media)
+        slimOpt = self.util.model.slim_optimize()
+        if isclose(0, slimOpt, abs_tol=1e-3):
+            print(f"\nThe model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt} in {environName} media")
         # simulate the model
         ## maximize the sum of all member biomass reactions)
         self.set_objective(targets=[species.primary_biomass.forward_variable for species in self.members])
@@ -366,11 +363,13 @@ class MSCommunity:
         else:   self.util.remove_constraint("_regularization")
 
         # threshold = self._regularization(linear=True)
-        try:    sol = self.run_fba(media, pfba)
-        except: sol = self.run_fba(media, pfba=False)
+        try:    sol = self.run_fba(None, pfba)
+        except: sol = self.run_fba(None, pfba=False)
         # if sol.status != "optimal":
         #     raise FeasibilityError(f"The simulation for minimal uptake in {self.util.model.id} was {sol.status}.")
         # reset the model conditions
+        self.util.remove_constraint("_regularization")
+        self.util.remove_constraint("min_comm_growth")
         self.util.model.solver.configuration.timeout = ogTimeout
         self.util.model.objective = ogObj
         self.util.model.medium = ogMedia
