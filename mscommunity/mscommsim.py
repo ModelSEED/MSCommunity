@@ -7,6 +7,7 @@ from modelseedpy.core.fbahelper import FBAHelper
 #from modelseedpy.fbapkg.gapfillingpkg import default_blacklist
 from modelseedpy.core.msatpcorrection import MSATPCorrection
 from mscommunity.commhelper import build_from_species_models
+from mscommunity.commkineticpkg import CommKineticPkg
 from mscommunity.mscommviz import interactions as mscommsim_interactions
 from cobra.io import save_matlab_model, write_sbml_model
 from itertools import combinations, permutations
@@ -173,7 +174,9 @@ class MSCommunity:
         # assign the MSCommunity constraints and objective
         self.rxnProbs = probs
         self.pkgmgr = MSPackageManager.get_pkg_mgr(self.util.model)
-        self.pkgmgr.getpkg("CommKineticPkg").build_package(kinetic_coeff, self, self.rxnProbs)
+        kinetic_pkg = CommKineticPkg(self.util.model)
+        self.pkgmgr.addpkgobj(kinetic_pkg)
+        kinetic_pkg.build_package(kinetic_coeff, self, self.rxnProbs)
         if eleLimits is not None:
             self.pkgmgr.getpkg("ElementUptakePkg").build_package(eleLimits)
         # if kinetic_coeff is not None:   self.add_commkinetics(kinetic_coeff, probs)
