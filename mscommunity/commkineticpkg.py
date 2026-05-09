@@ -9,7 +9,7 @@ from modelseedpy.core.fbahelper import FBAHelper
 # Base class for FBA packages
 class CommKineticPkg(BaseFBAPkg):
     def __init__(self, model):
-        BaseFBAPkg.__init__(self, model, "community kinetics", {}, {"commkin": "string"})
+        BaseFBAPkg.__init__(self, model, "community kinetics", {}, {"commKin": "string"})
 
     def build_package(self, kinetic_coef, community_model, probs=None):
         self.validate_parameters({}, [], {"kinetic_coef": kinetic_coef, "community": community_model})

@@ -287,15 +287,32 @@ class MSCommunity:
 
     def regularization(self, linear=True, growth_constraint=True):
         self.util.remove_constraint("_regularization")
-        # self.util.remove_constraint("min_comm_growth")
-        commMax = self.util.model.slim_optimize()
+        # PATCH 1: min_comm_growth binds bio1 (community biomass), so its LB
+        # must come from the max of bio1 — not the max of whatever objective
+        # the caller currently has set (e.g. sum-of-member-biomasses).
         if growth_constraint:
             self.util.remove_constraint("min_comm_growth")
-            if commMax is not None and not isnan(commMax) and commMax > 1e-6:
+            ogObj_for_bio1 = self.util.model.objective
+            self.util.model.objective = self.util.model.problem.Objective(
+                self.primary_biomass.flux_expression, direction="max")
+            commMax_bio1 = self.util.model.slim_optimize()
+            self.util.model.objective = ogObj_for_bio1
+            if commMax_bio1 is not None and not isnan(commMax_bio1) and commMax_bio1 > 1e-6:
                 self.util.create_constraint(self.util.model.problem.Constraint(
-                    self.primary_biomass.flux_expression, name="min_comm_growth", lb=commMax*self._growth_fraction()), printing=True)
+                    self.primary_biomass.flux_expression, name="min_comm_growth",
+                    lb=commMax_bio1 * self._growth_fraction()), printing=True)
+        # commMax for the linear sweep is the max of the CURRENT objective,
+        # because permutation thresholds bound member-pairwise differences
+        # which are on the same scale as the current (sum-of-members) optimum.
+        commMax = self.util.model.slim_optimize()
         if linear:
+            if commMax is None or isnan(commMax) or commMax <= 1e-6:
+                return
             for threshold in [f * commMax for f in list(linspace(0.3, 0.5, 5)) + list(linspace(0.6, 1.0, 5))]:
+                # PATCH 2: clear permutation constraints from the previous
+                # threshold; without this they accumulate and the tightest
+                # one always wins, so loosening the threshold has no effect.
+                self.util.remove_constraint("_regularization")
                 for mem1, mem2 in permutations(self.members, 2):
                     ## mu_i - mu_j <= threshold   &   mu_j - mu_i <= threshold
                     consName = f"{mem1.id}_{mem2.id}_regularization"
@@ -356,21 +373,43 @@ class MSCommunity:
         if media is not None:
             self.util.add_medium(media)
         slimOpt = self.util.model.slim_optimize()
+        # PATCH 3: if kinetic constraints zero out growth on this medium, fall
+        # back to a no-kinetics simulation rather than returning None. This
+        # rescues low-yield carbons (e.g. Acetate) where Σ|flux| ≤ kinCoef·bio
+        # is unsatisfiable at any positive biomass for kinCoef=750. Use the
+        # cobra model's context manager so removed constraints auto-restore
+        # on exit (so the package's internal tracking stays consistent).
         if isclose(0, slimOpt, abs_tol=1e-3):
-            print(f"\nThe model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt} in {environName} media")
-        # simulate the model
-        ## maximize the sum of all member biomass reactions)
+            kin_cons = [c for c in self.util.model.constraints if "_commKin" in c.name]
+            if kin_cons:
+                with self.util.model:
+                    self.util.model.remove_cons_vars(kin_cons)
+                    slimOpt_no_kin = self.util.model.slim_optimize()
+                    if not isclose(0, slimOpt_no_kin, abs_tol=1e-3):
+                        print(f"Kinetic constraints disabled for {self.util.model.id} on {environName}: "
+                              f"slim_optimize was {slimOpt:.3g}, now {slimOpt_no_kin:.3g}")
+                        return self._predict_inner(pfba, timeout, regularization, update_abundances,
+                                                    ogObj, ogMedia, ogTimeout)
+                # context exits here, kinetic constraints auto-restored
+                print(f"\nThe model {self.util.model.id} doesn't grow even without kinetics on {environName}")
+                self.util.model.objective = ogObj
+                self.util.model.medium = ogMedia
+                self.util.model.solver.configuration.timeout = ogTimeout
+                return None
+            else:
+                print(f"\nThe model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt} in {environName} media")
+        return self._predict_inner(pfba, timeout, regularization, update_abundances,
+                                    ogObj, ogMedia, ogTimeout)
+
+    def _predict_inner(self, pfba, timeout, regularization, update_abundances,
+                       ogObj, ogMedia, ogTimeout):
+        # maximize the sum of all member biomass reactions
         self.set_objective(targets=[species.primary_biomass.forward_variable for species in self.members])
         self.util.model.solver.configuration.timeout = timeout
         if regularization:   threshold = self.regularization(linear=True)
         else:   self.util.remove_constraint("_regularization")
-
-        # threshold = self._regularization(linear=True)
         try:    sol = self.run_fba(None, pfba)
         except: sol = self.run_fba(None, pfba=False)
-        # if sol.status != "optimal":
-        #     raise FeasibilityError(f"The simulation for minimal uptake in {self.util.model.id} was {sol.status}.")
-        # reset the model conditions
         self.util.remove_constraint("_regularization")
         self.util.remove_constraint("min_comm_growth")
         self.util.model.solver.configuration.timeout = ogTimeout
