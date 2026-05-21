@@ -9,6 +9,13 @@ from modelseedpy.core.msatpcorrection import MSATPCorrection
 from mscommunity.commhelper import build_from_species_models
 from mscommunity.commkineticpkg import CommKineticPkg
 from mscommunity.mscommviz import interactions as mscommsim_interactions
+from mscommunity.batched_lp import (
+    BatchedSolution,
+    CommunityProblem,
+    LPInstance,
+    get_batched_solver,
+    media_to_bounds,
+)
 from cobra.io import save_matlab_model, write_sbml_model
 from itertools import combinations, permutations
 from cobra.core.dictlist import DictList
@@ -285,7 +292,7 @@ class MSCommunity:
         if self.printing:  print(f"The growth multiple is {growth_multiple}")
         return growth_multiple
 
-    def regularization(self, linear=True, growth_constraint=True):
+    def regularization(self, linear=True, growth_constraint=True, batch_backend="cpu", batch_workers=1):
         self.util.remove_constraint("_regularization")
         # PATCH 1: min_comm_growth binds bio1 (community biomass), so its LB
         # must come from the max of bio1 — not the max of whatever objective
@@ -301,33 +308,39 @@ class MSCommunity:
                 self.util.create_constraint(self.util.model.problem.Constraint(
                     self.primary_biomass.flux_expression, name="min_comm_growth",
                     lb=commMax_bio1 * self._growth_fraction()), printing=True)
-        # commMax for the linear sweep is the max of the CURRENT objective,
-        # because permutation thresholds bound member-pairwise differences
-        # which are on the same scale as the current (sum-of-members) optimum.
-        commMax = self.util.model.slim_optimize()
         if linear:
-            if commMax is None or isnan(commMax) or commMax <= 1e-6:
-                return
-            for threshold in [f * commMax for f in list(linspace(0.3, 0.5, 5)) + list(linspace(0.6, 1.0, 5))]:
-                # PATCH 2: clear permutation constraints from the previous
-                # threshold; without this they accumulate and the tightest
-                # one always wins, so loosening the threshold has no effect.
+            # PATCH 4: relative (per-member) regularization. The previous
+            # scheme bounded |mu_i - mu_j| <= threshold absolutely, which
+            # forced near-equal growth and collapsed real asymmetries
+            # (parasitism / commensalism / dominance). Instead, compute each
+            # member's solo capacity (what it could reach if the others were
+            # forced to zero growth in the same community model) and require
+            # each viable member to keep at least `ratio` of its own solo
+            # max. Members with zero solo capacity get no constraint, so a
+            # surviving member can grow at its full rate while a non-viable
+            # partner stays at zero.
+            # The N solo-max LPs all share the community S — only bounds and
+            # objective differ — so route them through the batched solver.
+            solo_max = self._solo_max_batch(backend=batch_backend, workers=batch_workers)
+            # Iterate from tight to loose so we land on the strictest feasible
+            for ratio in [0.7, 0.5, 0.3, 0.2, 0.1, 0.05]:
                 self.util.remove_constraint("_regularization")
-                for mem1, mem2 in permutations(self.members, 2):
-                    ## mu_i - mu_j <= threshold   &   mu_j - mu_i <= threshold
-                    consName = f"{mem1.id}_{mem2.id}_regularization"
-                    coef = {mem1.primary_biomass.forward_variable: 1, mem2.primary_biomass.forward_variable: -1}
-                    self.util.create_constraint(self.util.model.problem.Constraint(Zero, name=consName, ub=threshold), coef=coef, printing=True)
+                for mem in self.members:
+                    if solo_max[mem.id] > 1e-6:
+                        consName = f"{mem.id}_regularization"
+                        coef = {mem.primary_biomass.forward_variable: 1}
+                        self.util.create_constraint(self.util.model.problem.Constraint(
+                            Zero, name=consName, lb=ratio * solo_max[mem.id]), coef=coef, printing=True)
                 sol = self.util.model.optimize()
                 if sol.status == "optimal":
-                    print(f"The model {self.util.model.id} is regularized with a max member growth difference of {threshold}")
+                    print(f"The model {self.util.model.id} is regularized: each viable member keeps >={ratio*100:.0f}% of its solo capacity")
                     break
         else:
             # TODO create the least-squares method employed in MICOM
             pass
         commCurrent = self.util.model.slim_optimize()
-        ic(f"Max community growth ({commMax}) and after regularization ({commCurrent})")
-        return threshold
+        ic(f"Community growth after regularization ({commCurrent})")
+        return None
 
     def micom(self, media, tradeoff=0.6):
         media = [media] if type(media) == dict else media
@@ -469,4 +482,82 @@ class MSCommunity:
 
     def add_medium(self, media):
         self.util.add_medium(media)
-        
+
+    # --- Batched-LP entry points -----------------------------------------
+    # The community S matrix is fixed across samples / conditions; only
+    # bounds and objective vary. `extract_problem` snapshots that shared
+    # structure once and `solve_batch` routes a list of `LPInstance`s
+    # through a pluggable backend (cpu reference today, gpu later) without
+    # any call-site changes.
+
+    def extract_problem(self):
+        """Snapshot the live community model as a `CommunityProblem`."""
+        return CommunityProblem.from_model(self.util.model)
+
+    def solve_batch(self, instances, backend="cpu", problem=None, **backend_kwargs):
+        """Solve N independent LPs that share this community's S matrix."""
+        if problem is None:
+            problem = self.extract_problem()
+        solver = get_batched_solver(backend, **backend_kwargs)
+        return solver.solve(problem, instances)
+
+    def _solo_max_batch(self, backend="cpu", workers=1):
+        """Per-member solo growth max, batched over members.
+
+        Each member's LP zeros out the other members' biomass reactions and
+        maximizes its own — same S, different bounds and objective.
+        """
+        instances = []
+        for target in self.members:
+            bounds = {}
+            for other in self.members:
+                if other.id != target.id:
+                    bounds[other.primary_biomass.id] = (0.0, 0.0)
+            instances.append(LPInstance(
+                id=target.id,
+                bounds=bounds,
+                objective={target.primary_biomass.id: 1.0},
+                sense="max",
+            ))
+        results = self.solve_batch(instances, backend=backend, workers=workers)
+        solo = {}
+        for r in results:
+            v = r.objective_value
+            solo[r.id] = v if (v is not None and not isnan(v) and v > 1e-6) else 0
+        return solo
+
+    def predict_abundances_batch(self, medias, pfba=False, backend="cpu", workers=1):
+        """Predict member abundances across many media in one batched solve.
+
+        Each medium becomes an `LPInstance` whose bounds patch the exchange
+        reactions of the shared community model. The objective is the sum
+        of member primary biomass fluxes (matches `_predict_inner`).
+        """
+        problem = self.extract_problem()
+        obj_patch = {mem.primary_biomass.id: 1.0 for mem in self.members}
+        instances = []
+        for i, media in enumerate(medias):
+            bounds = media_to_bounds(self.util.model, media)
+            instances.append(LPInstance(
+                id=f"sample_{i}",
+                bounds=bounds,
+                objective=obj_patch,
+                sense="max",
+                pfba=pfba,
+            ))
+        results = self.solve_batch(instances, backend=backend, problem=problem, workers=workers)
+        out = []
+        for r in results:
+            if r.status != "optimal":
+                out.append(None)
+                continue
+            total = sum(r.fluxes.get(mem.primary_biomass.id, 0.0) for mem in self.members)
+            if isclose(0, total, abs_tol=1e-3):
+                out.append(None)
+                continue
+            out.append({
+                mem.id: r.fluxes.get(mem.primary_biomass.id, 0.0) / total
+                for mem in self.members
+            })
+        return out
+
