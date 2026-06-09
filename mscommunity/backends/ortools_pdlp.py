@@ -29,12 +29,14 @@ from ._pdhg import assemble_batch, stack_constraints
 
 try:
     from ortools.pdlp import solvers_pb2
+    from ortools.pdlp import solve_log_pb2
     from ortools.pdlp.python import pdlp
     _PDLP_OK = True
     _PDLP_ERR = None
 except Exception as _exc:  # pragma: no cover — import guard
     pdlp = None
     solvers_pb2 = None
+    solve_log_pb2 = None
     _PDLP_OK = False
     _PDLP_ERR = _exc
 
@@ -77,7 +79,10 @@ class ORToolsPDLPBatchedLPSolver(BatchedLPSolver):
             )
         self.workers = max(1, int(workers))
         self.params = solvers_pb2.PrimalDualHybridGradientParams()
-        self.params.termination_criteria.eps_optimal_relative.gap = (
+        # OR-Tools >= 9.x exposes eps_optimal_relative as a scalar float field
+        # on termination_criteria (older builds nested it under a message with
+        # a `.gap` attribute). Set the scalar directly.
+        self.params.termination_criteria.eps_optimal_relative = (
             termination_relative_gap
         )
         self.params.termination_criteria.iteration_limit = (
@@ -93,10 +98,11 @@ class ORToolsPDLPBatchedLPSolver(BatchedLPSolver):
             res = pdlp.primal_dual_hybrid_gradient(qp, self.params)
             x = np.asarray(res.primal_solution, dtype=np.float64)
             obj_internal = float(np.dot(c_h[i], x))
+            # The termination-reason enum lives in solve_log_pb2 (OR-Tools 9.x).
             status_enum = res.solve_log.termination_reason
             status = (
                 "optimal"
-                if status_enum == solvers_pb2.TERMINATION_REASON_OPTIMAL
+                if status_enum == solve_log_pb2.TERMINATION_REASON_OPTIMAL
                 else f"pdlp:{int(status_enum)}"
             )
             fluxes = {
