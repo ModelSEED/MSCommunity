@@ -187,8 +187,16 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     # adds only unique reactions and metabolites to the community model
     newmodel = Model(model_id or "+".join([model.id for model in models]),
                      name or " + ".join([model.name for model in models]))
-    newmodel.add_reactions(FBAHelper.filter_cobra_set(new_reactions))
-    newmodel.add_metabolites(FBAHelper.filter_cobra_set(new_metabolites))
+    # DETERMINISM FIX: new_reactions / new_metabolites are Python sets (see ~L67),
+    # so their iteration order varies between otherwise-identical builds (it depends
+    # on per-object hashes, and every build re-.copy()s fresh objects). That
+    # nondeterministic order then (a) randomizes the community model's variable
+    # order, so an LP solver returns DIFFERENT alternate-optima vertices run-to-run,
+    # and (b) randomizes `other_biomass_cpds` in MSCommunity.__init__, scrambling
+    # which member id maps to compartment c1 vs c2 — so memGrowths["EC"] could read
+    # PP's biomass flux. Sort by id before adding so construction is reproducible.
+    newmodel.add_reactions(sorted(FBAHelper.filter_cobra_set(new_reactions), key=lambda r: r.id))
+    newmodel.add_metabolites(sorted(FBAHelper.filter_cobra_set(new_metabolites), key=lambda m: m.id))
     newmodel.add_reactions([comm_biorxn])
     newutl = MSModelUtil(newmodel, False, climit=climit, o2limit=o2limit)
     newutl.add_objective(comm_biorxn.flux_expression)

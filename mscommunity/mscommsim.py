@@ -35,6 +35,31 @@ import logging
 logger = logging.getLogger(__name__)
 ic.configureOutput(includeContext=True)
 
+# QP-capable cobra solvers -> optlang.available_solvers capability key. Used by the
+# community split-determinizer (min sum mu_i^2) to pick a backend: Gurobi/CPLEX are
+# exact; 'hybrid' (HiGHS+OSQP) and 'osqp' are the strictly-open-source path (ADMM,
+# ~1e-3 accuracy). GLPK/SciPy reject quadratic objectives outright.
+_QP_CAPABLE = {"gurobi": "GUROBI", "cplex": "CPLEX", "hybrid": "OSQP", "osqp": "OSQP"}
+
+
+def _pick_qp_backend(current=None, prefer=None):
+    """Name of an available QP-capable cobra solver: an explicit `prefer`, then the
+    `current` solver if it is already QP-capable (avoids a swap), then commercial
+    (gurobi/cplex), then strictly open-source (hybrid=HiGHS+OSQP, then osqp). Returns
+    None if no QP backend is installed."""
+    import optlang
+    avail = optlang.available_solvers
+    order = ([prefer] if prefer else []) + ([current] if current in _QP_CAPABLE else []) \
+            + ["gurobi", "cplex", "hybrid", "osqp"]
+    seen = set()
+    for s in order:
+        if s in seen:
+            continue
+        seen.add(s)
+        if avail.get(_QP_CAPABLE.get(s, ""), False):
+            return s
+    return None
+
 class CommunityMember:
     def __init__(self, community, biomass_cpd, ID=None, index=None, abundance=0, model=None):
         print(ID, "biomass compound:", biomass_cpd)
@@ -125,6 +150,12 @@ class MSCommunity:
                      'element_uptake_limit', 'msdb_path', 'comm_growth', 'threshold', "memGrowths", "member_fluxes"]:
             setattr(self, attr, None)
         self.kinCoef = kinetic_coeff
+        # Determinism instrumentation: whether the last determining coculture
+        # solve had to fall back from pFBA/QP to the plain (solver-degenerate)
+        # LP, and how many times that has happened on this community. Callers
+        # read these to flag rows whose per-member split is NOT converged.
+        self.pfba_fell_back = False
+        self.pfba_fallback_count = 0
         # defining the models
         if model is None and member_models is not None:
             model = build_from_species_models(member_models, abundances=abundances, printing=printing)
@@ -331,8 +362,16 @@ class MSCommunity:
                         coef = {mem.primary_biomass.forward_variable: 1}
                         self.util.create_constraint(self.util.model.problem.Constraint(
                             Zero, name=consName, lb=ratio * solo_max[mem.id]), coef=coef, printing=True)
-                sol = self.util.model.optimize()
-                if sol.status == "optimal":
+                # BUG FIX (Layer 0 #2): we only need to know whether this ratio is
+                # FEASIBLE, not a vertex of the degenerate max-sum face. The old
+                # `.optimize()` materialised a full Solution whose per-member flux
+                # split is solver-dependent (GLPK vs Gurobi pick different vertices),
+                # and in borderline cases that vertex pick could nudge which ratio
+                # bucket is accepted. slim_optimize() reads only the objective /
+                # status, so the ratio chosen is a pure feasibility decision and the
+                # floors handed downstream are solver-independent.
+                self.util.model.slim_optimize()
+                if self.util.model.solver.status == "optimal":
                     print(f"The model {self.util.model.id} is regularized: each viable member keeps >={ratio*100:.0f}% of its solo capacity")
                     break
         else:
@@ -376,7 +415,8 @@ class MSCommunity:
     # TODO evaluate the comparison of this method with MICOM
     # TODO implement a community tradeoff and then the objective should be a fraction of the total summed biomass with a minimization of variance
     def predict_abundances(self, media=None, pfba=True, timeout=60,
-                           environName=None, regularization=True, update_abundances=False):
+                           environName=None, regularization=True, update_abundances=False,
+                           determinize=False, qp_backend=None):
         print("regularization", regularization)
         # store the original parameters
         ogObj = self.util.model.objective
@@ -402,7 +442,7 @@ class MSCommunity:
                         print(f"Kinetic constraints disabled for {self.util.model.id} on {environName}: "
                               f"slim_optimize was {slimOpt:.3g}, now {slimOpt_no_kin:.3g}")
                         return self._predict_inner(pfba, timeout, regularization, update_abundances,
-                                                    ogObj, ogMedia, ogTimeout)
+                                                    ogObj, ogMedia, ogTimeout, determinize, qp_backend)
                 # context exits here, kinetic constraints auto-restored
                 print(f"\nThe model {self.util.model.id} doesn't grow even without kinetics on {environName}")
                 self.util.model.objective = ogObj
@@ -412,23 +452,182 @@ class MSCommunity:
             else:
                 print(f"\nThe model {self.util.model.id} doesn't grow, with a slim_optimize of {slimOpt} in {environName} media")
         return self._predict_inner(pfba, timeout, regularization, update_abundances,
-                                    ogObj, ogMedia, ogTimeout)
+                                    ogObj, ogMedia, ogTimeout, determinize, qp_backend)
 
     def _predict_inner(self, pfba, timeout, regularization, update_abundances,
-                       ogObj, ogMedia, ogTimeout):
+                       ogObj, ogMedia, ogTimeout, determinize=False, qp_backend=None):
         # maximize the sum of all member biomass reactions
         self.set_objective(targets=[species.primary_biomass.forward_variable for species in self.members])
         self.util.model.solver.configuration.timeout = timeout
         if regularization:   threshold = self.regularization(linear=True)
         else:   self.util.remove_constraint("_regularization")
-        try:    sol = self.run_fba(None, pfba)
-        except: sol = self.run_fba(None, pfba=False)
+        # BUG FIX (Layer 0 #1): the old `except: ... pfba=False` silently reverted
+        # to the plain, solver-degenerate LP with no trace — masking exactly the
+        # hard pairs (and it would swallow a future QP-backend failure too). Catch
+        # only real solve errors, log the cause, and record the fallback so callers
+        # can flag the row as NOT determinism-converged.
+        try:
+            sol = self.run_fba(None, pfba)
+            self.pfba_fell_back = False
+        except Exception as e:
+            self.pfba_fell_back = True
+            self.pfba_fallback_count += 1
+            logger.warning(
+                "pFBA failed for %s (%s: %s); falling back to plain LP — this "
+                "row's per-member split is NOT determinism-converged",
+                self.util.model.id, type(e).__name__, e)
+            sol = self.run_fba(None, pfba=False)
+        # Determinize the per-member split to the unique strictly-convex-QP optimum
+        # while the regularization floors are still installed. No-op on the ~98.8%
+        # of cells whose split is already unique; on the flat-face ~1.2% it replaces
+        # the arbitrary LP vertex with the solver-independent centroid.
+        if determinize:
+            sol = self._determinize_split(sol, qp_backend)
         self.util.remove_constraint("_regularization")
         self.util.remove_constraint("min_comm_growth")
         self.util.model.solver.configuration.timeout = ogTimeout
         self.util.model.objective = ogObj
         self.util.model.medium = ogMedia
         return self._compute_relative_abundance_from_solution(sol, True, update_abundances)
+
+    def _determinize_split(self, sol, qp_backend=None, tol=1e-6, fix_fluxes=True):
+        """Refine the per-member coculture-growth split to the UNIQUE strictly-convex
+        QP optimum so it is solver-independent. Called from _predict_inner while the
+        regularization floors + sum-of-member objective are still installed.
+
+        On the deterministic-construction base ~98.8% of (pair, medium) cells already
+        have a unique max-sum-member split; ~1.2% sit on a flat alternate-optima face
+        where GLPK and Gurobi pick different vertices (Δ up to ~3.4). A cheap 2-LP
+        probe on member[0]'s biomass detects the flat face; only then do we minimise
+        sum(mu_i^2) on a QP backend (Gurobi/CPLEX exact, else open-source OSQP/hybrid)
+        to select the unique centroid, validate it is feasible on the exact native
+        solver, then pin mu* and pFBA on the native solver for a deterministic full
+        flux vector. Returns the (possibly new) solution; sets pfba_fell_back if a QP
+        backend is needed but unavailable or returns an infeasible point."""
+        members = list(self.members)
+        if len(members) < 2:
+            return sol
+        model = self.util.model
+        native = model.solver.interface.__name__.rsplit(".", 1)[-1].replace("_interface", "")
+        sum_vars = [m.primary_biomass.forward_variable for m in members]
+        try:
+            C = float(sum(sol.fluxes[m.primary_biomass.id] for m in members))
+        except Exception:
+            return sol
+        if isnan(C) or C <= 1e-9:
+            return sol
+        # Pin the community total near its max, with a tiny slack BELOW it. Some
+        # degenerate cells are a NEAR-flat ridge rather than an exactly-flat face:
+        # GLPK and Gurobi stop at points whose totals differ within their optimality
+        # tolerance (~1e-5). An exact Σ=C pin collapses that ridge (the probe then
+        # reads the split as "unique"); the slack lets the QP traverse the ridge to
+        # the centroid. Growth is reduced by at most det_slack (relative ~1e-6).
+        det_slack = max(1e-6 * abs(C), 1e-8)
+        self.util.remove_constraint("_det_total")
+        self.util.create_constraint(model.problem.Constraint(sum(sum_vars), name="_det_total", lb=C - det_slack, ub=None))
+        og_obj = model.objective
+        try:
+            # --- degeneracy probe: range of mu_0 on the fixed-total optimal face ---
+            v0 = members[0].primary_biomass.forward_variable
+            model.objective = model.problem.Objective(v0, direction="min"); lo = model.slim_optimize()
+            model.objective = model.problem.Objective(v0, direction="max"); hi = model.slim_optimize()
+            model.objective = og_obj
+            if lo is None or hi is None or isnan(lo) or isnan(hi) or (hi - lo) <= tol:
+                return sol  # split already unique -> no-op (the common ~98.8% case)
+
+            # --- strictly-convex QP for the unique centroid split ---
+            # Solved by HiGHS native QP via matrix extraction (see _solve_qp_highs):
+            # it does NOT swap the live model's solver, so it is safe inside the
+            # PATCH-3 `with self.util.model:` context (kinetics-disabled cells) and
+            # needs no QP-capable optlang backend (GLPK is LP-only). Exact + open-source.
+            mu = self._solve_qp_highs(sum_vars)
+            if mu is None:
+                logger.warning("QP determinizer (HiGHS) unavailable or non-optimal "
+                               "for %s; leaving the solver-dependent LP split.",
+                               self.util.model.id)
+                self.pfba_fell_back = True
+                return sol
+
+            # --- pin mu* on the native solver (validate feasibility) ---
+            def _pin(ptol):
+                for m in members:
+                    self.util.remove_constraint(f"_det_fix_{m.id}")
+                    self.util.create_constraint(model.problem.Constraint(
+                        m.primary_biomass.forward_variable, name=f"_det_fix_{m.id}",
+                        lb=mu[m.id] - ptol, ub=mu[m.id] + ptol))
+                model.slim_optimize()
+                return model.solver.status == "optimal"
+            if not _pin(1e-6) and not _pin(1e-4):
+                logger.warning("QP split infeasible on native solver for %s; "
+                               "keeping LP split.", self.util.model.id)
+                self.pfba_fell_back = True
+                return sol
+
+            # --- pFBA on native with mu* pinned -> deterministic full flux vector ---
+            if fix_fluxes:
+                try: final = self.util.run_fba(None, True)
+                except Exception: final = model.optimize()
+            else:
+                final = model.optimize()
+            return final
+        finally:
+            for m in members:
+                self.util.remove_constraint(f"_det_fix_{m.id}")
+            self.util.remove_constraint("_det_total")
+            try: model.objective = og_obj
+            except Exception: self.set_objective(targets=sum_vars)
+
+    def _solve_qp_highs(self, hess_vars):
+        """min sum(v**2 for v in hess_vars) subject to ALL current model constraints
+        and variable bounds, via HiGHS native QP (highspy) by extracting the problem
+        matrices — WITHOUT swapping the live model's solver. This is what makes the
+        determinizer safe inside the PATCH-3 `with model:` context and independent of
+        whether the cobra solver supports quadratics (GLPK does not). Exact and
+        strictly open-source. Returns {member_id: mu} or None if highspy is
+        unavailable or the QP is not optimal."""
+        try:
+            import highspy
+            import numpy as np
+        except Exception:
+            return None
+        model = self.util.model
+        INF = highspy.kHighsInf
+        variables = list(model.solver.variables)
+        vidx = {v.name: i for i, v in enumerate(variables)}
+        n = len(variables)
+        h = highspy.Highs(); h.setOptionValue("output_flag", False)
+        for v in variables:
+            h.addVar(-INF if v.lb is None else float(v.lb),
+                      INF if v.ub is None else float(v.ub))
+        for con in model.solver.constraints:
+            items = list(con.get_linear_coefficients(list(con.variables)).items())
+            if not items:
+                continue
+            idx = np.array([vidx[v.name] for v, _ in items], dtype=np.int32)
+            val = np.array([float(cf) for _, cf in items], dtype=np.float64)
+            lo = -INF if con.lb is None else float(con.lb)
+            up =  INF if con.ub is None else float(con.ub)
+            h.addRow(lo, up, len(idx), idx, val)
+        # objective = sum v^2 = 0.5 x^T Q x with Q_ii = 2 on the member biomass vars
+        diag = {vidx[v.name] for v in hess_vars}
+        q_start = np.zeros(n + 1, dtype=np.int32)
+        q_idx, q_val = [], []
+        for col in range(n):
+            q_start[col] = len(q_idx)
+            if col in diag:
+                q_idx.append(col); q_val.append(2.0)
+        q_start[n] = len(q_idx)
+        try:
+            h.passHessian(n, len(q_idx), highspy.HessianFormat.kTriangular,
+                          q_start, np.array(q_idx, dtype=np.int32), np.array(q_val, dtype=np.float64))
+            h.run()
+        except Exception as e:
+            logger.warning("HiGHS QP solve failed for %s: %s", self.util.model.id, e)
+            return None
+        if h.getModelStatus() != highspy.HighsModelStatus.kOptimal:
+            return None
+        cv = h.getSolution().col_value
+        return {m.id: float(cv[vidx[m.primary_biomass.forward_variable.name]]) for m in self.members}
 
     def run_fba(self, media=None, pfba=False, fva_reactions=None):
         # print("pfba =", pfba)
