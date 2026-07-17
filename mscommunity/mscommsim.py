@@ -24,7 +24,7 @@ from optlang.symbolics import Zero
 from cobra.flux_analysis import pfba
 from cobra import Reaction, Model
 from numpy import array, logspace, linspace
-from os import makedirs, path
+from os import makedirs, path, environ
 from math import isclose, isnan
 from icecream import ic
 from pandas import DataFrame
@@ -595,7 +595,15 @@ class MSCommunity:
         variables = list(model.solver.variables)
         vidx = {v.name: i for i, v in enumerate(variables)}
         n = len(variables)
-        h = highspy.Highs(); h.setOptionValue("output_flag", False)
+        h = highspy.Highs()
+        h.setOptionValue("output_flag", False)
+        h.setOptionValue("log_to_console", False)
+        # Hard wall-clock cap so a pathological/degenerate community QP can never
+        # hang the whole scoring run (some KBase-reconstructed communities sent
+        # HiGHS into a non-terminating solve). On time-out the status is not
+        # kOptimal, so we return None below and fall back to the LP split
+        # (flagged via pfba_fell_back) instead of blocking forever.
+        h.setOptionValue("time_limit", float(environ.get("QP_TIME_LIMIT", "20")))
         for v in variables:
             h.addVar(-INF if v.lb is None else float(v.lb),
                       INF if v.ub is None else float(v.ub))
