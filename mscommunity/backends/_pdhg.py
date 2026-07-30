@@ -18,6 +18,7 @@ adaptive step sizes / restart heuristics to PDLP-class backends.
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
@@ -39,7 +40,15 @@ class PDHGConfig:
 class ArrayBackend:
     """Library-agnostic shim. `xp` is the array namespace; `to_device` and
     `to_host` move tensors; `sparse_from_scipy` returns whatever the
-    backend's matmul expects on the left."""
+    backend's matmul expects on the left.
+
+    `allow_float32` opts a backend out of the double-precision guard in
+    `run_pdhg_batch`. The kernel asks for float64 everywhere, so a backend
+    that quietly hands back float32 (JAX without x64) would run different
+    math from NumPy / CuPy while claiming otherwise. By default that is a
+    hard error; a backend that cannot do float64 must set this flag
+    deliberately and tell the user what it costs.
+    """
 
     xp: Any
     to_device: Callable[[np.ndarray], Any]
@@ -47,6 +56,8 @@ class ArrayBackend:
     sparse_from_scipy: Callable[[sp.spmatrix], Any]
     spmm: Callable[[Any, Any], Any]      # A (m,n)   X (n,B) -> (m,B)
     spmm_T: Callable[[Any, Any], Any]    # A^T (n,m) Y (m,B) -> (n,B)
+    allow_float32: bool = False
+    name: str = "pdhg"
 
 
 def assemble_batch(
@@ -140,6 +151,37 @@ def estimate_spectral_norm(
     return float(backend.xp.linalg.norm(Av))
 
 
+def _check_double_precision(backend: ArrayBackend, arr: Any) -> None:
+    """Fail loudly if a backend downgraded our float64 request.
+
+    Every array in the kernel is created as float64 so that the docstring
+    claim -- identical math across NumPy / CuPy / JAX -- actually holds.
+    Some backends (JAX without `jax_enable_x64`) silently truncate to
+    float32 instead, which costs ~9 significant digits. Rather than let
+    that pass unnoticed we stop here, unless the backend explicitly
+    declared `allow_float32`.
+    """
+    dtype = np.dtype(getattr(arr, "dtype", np.float64))
+    if dtype == np.float64:
+        return
+    if backend.allow_float32:
+        warnings.warn(
+            f"{backend.name} backend is running the PDHG kernel in {dtype} "
+            f"rather than the requested float64; results will agree with the "
+            f"NumPy backend only to single precision (~1e-6, not ~1e-15).",
+            RuntimeWarning, stacklevel=3,
+        )
+        return
+    raise RuntimeError(
+        f"{backend.name} backend downgraded the PDHG kernel from float64 to "
+        f"{dtype}. The kernel requires double precision to match the NumPy "
+        f"and CuPy backends. Enable 64-bit support in the array library (for "
+        f"JAX: JAX_ENABLE_X64=1, or the `x64` option on the solver), or "
+        f"construct the ArrayBackend with allow_float32=True to accept the "
+        f"reduced precision knowingly."
+    )
+
+
 def run_pdhg_batch(
     backend: ArrayBackend,
     problem,
@@ -175,6 +217,7 @@ def run_pdhg_batch(
 
     x = xp.zeros((n, B), dtype=xp.float64)
     y = xp.zeros((m + e, B), dtype=xp.float64)
+    _check_double_precision(backend, x)
 
     iters_used = 0
     for k in range(cfg.max_iters):

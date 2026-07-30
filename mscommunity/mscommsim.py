@@ -60,6 +60,23 @@ def _pick_qp_backend(current=None, prefer=None):
             return s
     return None
 
+
+def _select_biomass_cpd(entry, preferred, fallback):
+    """Resolve one member-biomass metabolite from a `member_biomass_cpds` note entry.
+
+    `commhelper.build_from_species_models` stores that note as
+    {model_id: LIST of biomass metabolites} (it setdefault(...).append()s every
+    cpd11416/"biomass"-named metabolite it renames), and those metabolites belong
+    to the pre-copy model. `preferred` maps id -> metabolite of the live community
+    model for the member-biomass compounds that feed the primary biomass;
+    `fallback` maps id -> any metabolite of the live model. Returns None when the
+    entry matches nothing."""
+    entries = list(entry) if isinstance(entry, (list, tuple, set)) else [entry]
+    hits = [preferred[cpd.id] for cpd in entries if cpd.id in preferred]
+    if not hits:  hits = [fallback[cpd.id] for cpd in entries if cpd.id in fallback]
+    return hits[0] if hits else None
+
+
 class CommunityMember:
     def __init__(self, community, biomass_cpd, ID=None, index=None, abundance=0, model=None):
         print(ID, "biomass compound:", biomass_cpd)
@@ -139,15 +156,21 @@ class CommunityMember:
 
 class MSCommunity:
     def __init__(self, model=None, member_models: list = None, abundances=None, ids=None, kinetic_coeff=750,
-                 flux_limit=300, probs={}, climit=None, o2limit=None, lp_filename=None, printing=False, eleLimits=None, ID=None):
+                 flux_limit=300, probs=None, climit=None, o2limit=None, lp_filename=None, printing=False, eleLimits=None, ID=None):
+        # `flux_limit` is UNUSED: nothing in the package reads it. It is kept only so
+        # existing positional/keyword callers do not break; pass it or not, it has no
+        # effect. `probs` was a mutable {} default shared by every instance (mutating
+        # one community's rxnProbs would silently edit the default) -> None sentinel.
         assert model is not None or member_models is not None, "Either the community model and the member models must be defined."
+        probs = probs if probs is not None else {}
         self.lp_filename = lp_filename
         self.printing = printing
         self.gapfillings = {}
 
         #Define Data attributes as None
         for attr in ['solution', 'biomass_cpd', 'primary_biomass', 'biomass_drain', 'threshold', 'msgapfill', 
-                     'element_uptake_limit', 'msdb_path', 'comm_growth', 'threshold', "memGrowths", "member_fluxes"]:
+                     'element_uptake_limit', 'msdb_path', 'comm_growth', 'threshold', "memGrowths", "member_fluxes",
+                     "suboptimal_solution"]:
             setattr(self, attr, None)
         self.kinCoef = kinetic_coeff
         # Determinism instrumentation: whether the last determining coculture
@@ -179,6 +202,10 @@ class MSCommunity:
                     elif rxn.metabolites[self.biomass_cpd] < 0 and len(rxn.metabolites) == 1:  self.biomass_drain = rxn
             elif 'c' in self.biomass_cpd.compartment:   other_biomass_cpds.append(self.biomass_cpd)
         
+        # lookups into the LIVE (possibly copied) community model, since
+        # model.notes["member_biomass_cpds"] holds pre-copy metabolite objects
+        memberBioCPDs = {cpd.id: cpd for cpd in other_biomass_cpds}
+        allModelCPDs = {met.id: met for met in self.util.model.metabolites}
         if ids is None:
             if member_models is not None:   ids = [mem.id for mem in member_models]
             else:  ids = [f"Species{i}" for i in range(len(other_biomass_cpds))]
@@ -189,16 +216,15 @@ class MSCommunity:
                               for memIndex, bioCpd in enumerate(other_biomass_cpds)}
             else:
                 abundances = {}
-                for memID, bioCPD in model.notes["member_biomass_cpds"].items():
+                for memID, bioCPDs in model.notes["member_biomass_cpds"].items():
                     abundances[memID] = {"abundance": 1/len(other_biomass_cpds)}
-                    for met in model.metabolites:
-                        if bioCPD.id == met.id:
-                            if "biomass_compound" in abundances[memID]:   print("duplicate", bioCPD.id, met.id)
-                            abundances[memID].update({"biomass_compound": met})
-                            # print(bioCPD, met.id)
-                    if "biomass_compound" not in abundances[memID]:   print(f"The {memID} bioCPD was not captured")
+                    met = _select_biomass_cpd(bioCPDs, memberBioCPDs, allModelCPDs)
+                    if met is None:   print(f"The {memID} bioCPD was not captured")
+                    else:  abundances[memID].update({"biomass_compound": met})
         elif "abundance" not in list(abundances.values())[0]:
-            abundances = {memID:{"abundance": abund, "biomass_compound": model.notes["member_biomass_cpds"][memID]}
+            abundances = {memID:{"abundance": abund,
+                                 "biomass_compound": _select_biomass_cpd(
+                                     model.notes["member_biomass_cpds"][memID], memberBioCPDs, allModelCPDs)}
                             for memID, abund in abundances.items()}
 
         # print()   # this returns the carriage after the tab-ends in the biomass compound printing
@@ -276,7 +302,8 @@ class MSCommunity:
     #Utility functions
     def print_lp(self, filename=None):
         filename = filename or self.lp_filename
-        makedirs(path.dirname(filename), exist_ok=True)
+        # a bare relative filename has no dirname; makedirs("") raises FileNotFoundError
+        if path.dirname(filename):  makedirs(path.dirname(filename), exist_ok=True)
         with open(filename, 'w') as out:  out.write(str(self.util.model.solver))  ;  out.close()
 
     def to_sbml(self, export_name):
@@ -325,6 +352,22 @@ class MSCommunity:
 
     def regularization(self, linear=True, growth_constraint=True, batch_backend="cpu", batch_workers=1):
         self.util.remove_constraint("_regularization")
+        # PATCH 5: the per-member solo capacities MUST be measured with the community
+        # growth floor suspended. min_comm_growth pins bio1 >= f*max, but bio1 consumes
+        # EVERY member's biomass metabolite and nothing else produces them, so a solo
+        # LP -- which pins the other members' biomass reactions to (0, 0) -- forces
+        # v_bio1 = 0 and contradicts any strictly positive floor: every solo LP came
+        # back infeasible and every member's capacity was recorded as garbage/zero, so
+        # no per-member floor was ever installed. Measure first (and defensively drop a
+        # floor left over from an earlier call, restoring it via the model context),
+        # then install the floor for the ratio loop and the determining solve below.
+        solo_max = None
+        if linear:
+            leftoverFloor = [cons for cons in self.util.model.constraints if cons.name == "min_comm_growth"]
+            with self.util.model:
+                if leftoverFloor:  self.util.model.remove_cons_vars(leftoverFloor)
+                solo_max = self._solo_max_batch(backend=batch_backend, workers=batch_workers)
+            # the context manager restores any suspended floor on exit
         # PATCH 1: min_comm_growth binds bio1 (community biomass), so its LB
         # must come from the max of bio1 — not the max of whatever objective
         # the caller currently has set (e.g. sum-of-member-biomasses).
@@ -351,8 +394,8 @@ class MSCommunity:
             # surviving member can grow at its full rate while a non-viable
             # partner stays at zero.
             # The N solo-max LPs all share the community S — only bounds and
-            # objective differ — so route them through the batched solver.
-            solo_max = self._solo_max_batch(backend=batch_backend, workers=batch_workers)
+            # objective differ — so route them through the batched solver. They are
+            # solved above, BEFORE min_comm_growth is installed (see PATCH 5).
             # Iterate from tight to loose so we land on the strictest feasible
             for ratio in [0.7, 0.5, 0.3, 0.2, 0.1, 0.05]:
                 self.util.remove_constraint("_regularization")
@@ -383,7 +426,37 @@ class MSCommunity:
 
     def micom(self, media, tradeoff=0.6):
         media = [media] if type(media) == dict else media
-        self.util.model.solver = "hybrid"
+        # The second stage minimises sum(mu_i^2), so a QP-capable backend is required.
+        # Hard-coding "hybrid" here blew up before anything else ran whenever the
+        # incumbent already was QP-capable (a Gurobi model carries LP-method settings
+        # that optlang's hybrid interface rejects: "LP Method primal is not valid").
+        # Keep the incumbent when it can already do QP, otherwise swap to the best
+        # available backend and always swap back.
+        ogSolver = self.util.model.solver.interface.__name__.rsplit(".", 1)[-1].replace("_interface", "")
+        qpSolver = _pick_qp_backend(current=ogSolver)
+        if qpSolver is None:
+            raise RuntimeError("micom() minimizes a quadratic objective, but no QP-capable solver "
+                               f"is available (any of {sorted(_QP_CAPABLE)}); install gurobi, cplex, "
+                               "or osqp (the 'hybrid' HiGHS+OSQP path).")
+        swapped = qpSolver != ogSolver
+        # the incoming (linear) objective, captured as interface-independent coefficients
+        ogObjCoefs = {rxn.id: rxn.objective_coefficient for rxn in self.util.model.reactions
+                      if rxn.objective_coefficient}
+        ogObjDir = self.util.model.objective.direction
+        if swapped:  self.util.model.solver = qpSolver
+        try:  solutions = self._micom_inner(media, tradeoff)
+        finally:
+            # The min-sum(mu^2) objective is still installed here, and a quadratic
+            # objective cannot be cloned into a non-QP interface — restoring the solver
+            # first would raise "GLPK only supports linear objectives". So put the
+            # caller's objective back while the QP backend is still live, then swap.
+            ogObjExpr = sum([coef * self.util.model.reactions.get_by_id(rxnID).flux_expression
+                             for rxnID, coef in ogObjCoefs.items()]) if ogObjCoefs else Zero
+            self.util.model.objective = self.util.model.problem.Objective(ogObjExpr, direction=ogObjDir)
+            if swapped:  self.util.model.solver = ogSolver
+        return solutions
+
+    def _micom_inner(self, media, tradeoff):
         solutions = []
         for m in media:
             # add the objectives
@@ -466,13 +539,11 @@ class MSCommunity:
         # hard pairs (and it would swallow a future QP-backend failure too). Catch
         # only real solve errors, log the cause, and record the fallback so callers
         # can flag the row as NOT determinism-converged.
+        self.pfba_fell_back = False
         try:
             sol = self.run_fba(None, pfba)
-            self.pfba_fell_back = False
         except Exception as e:
-            self.pfba_fell_back = True
-            self.pfba_fallback_count += 1
-            logger.warning(
+            self._note_fallback(
                 "pFBA failed for %s (%s: %s); falling back to plain LP — this "
                 "row's per-member split is NOT determinism-converged",
                 self.util.model.id, type(e).__name__, e)
@@ -489,6 +560,19 @@ class MSCommunity:
         self.util.model.objective = ogObj
         self.util.model.medium = ogMedia
         return self._compute_relative_abundance_from_solution(sol, True, update_abundances)
+
+    def _note_fallback(self, message, *args):
+        """Record that THIS row's per-member split is not determinism-converged.
+
+        `pfba_fell_back` is the per-row flag (reset at the top of `_predict_inner`)
+        and `pfba_fallback_count` counts ROWS, not events: a row that both loses pFBA
+        and fails to determinize is counted once. Previously only `_predict_inner`'s
+        pFBA handler touched the counter, so the determinizer's own failure paths were
+        invisible and the count under-reported the true non-converged rate."""
+        if not self.pfba_fell_back:
+            self.pfba_fell_back = True
+            self.pfba_fallback_count += 1
+        logger.warning(message, *args)
 
     def _determinize_split(self, sol, qp_backend=None, tol=1e-6, fix_fluxes=True):
         """Refine the per-member coculture-growth split to the UNIQUE strictly-convex
@@ -542,10 +626,9 @@ class MSCommunity:
             # needs no QP-capable optlang backend (GLPK is LP-only). Exact + open-source.
             mu = self._solve_qp_highs(sum_vars)
             if mu is None:
-                logger.warning("QP determinizer (HiGHS) unavailable or non-optimal "
-                               "for %s; leaving the solver-dependent LP split.",
-                               self.util.model.id)
-                self.pfba_fell_back = True
+                self._note_fallback("QP determinizer (HiGHS) unavailable or non-optimal "
+                                    "for %s; leaving the solver-dependent LP split.",
+                                    self.util.model.id)
                 return sol
 
             # --- pin mu* on the native solver (validate feasibility) ---
@@ -558,9 +641,8 @@ class MSCommunity:
                 model.slim_optimize()
                 return model.solver.status == "optimal"
             if not _pin(1e-6) and not _pin(1e-4):
-                logger.warning("QP split infeasible on native solver for %s; "
-                               "keeping LP split.", self.util.model.id)
-                self.pfba_fell_back = True
+                self._note_fallback("QP split infeasible on native solver for %s; "
+                                    "keeping LP split.", self.util.model.id)
                 return sol
 
             # --- pFBA on native with mu* pinned -> deterministic full flux vector ---
@@ -667,12 +749,30 @@ class MSCommunity:
             ic(f"{mem.id} grows {self.solution.fluxes[mem.primary_biomass.id]} with abundance {mem.abundance}")
         return abundances
 
-    def _set_solution(self, solution):
+    def _set_solution(self, solution, dump_diagnostics=None):
         if solution.status != "optimal":
-            FeasibilityError(f'The solution is sub-optimal, with a(n) {solution} status.')
-            self.solution = None
-            self.print_lp("erronous_model.lp")
-            save_matlab_model(self.util.model, self.util.model.name + ".mat")
+            # This used to be silent AND fatal at once: the FeasibilityError was
+            # constructed but never raised (so a sub-optimal solution was consumed as
+            # if optimal), while the unconditional diagnostic dump crashed on the bare
+            # relative "erronous_model.lp" (print_lp -> makedirs("")). Be loud instead,
+            # and only dump when the caller opted in through `lp_filename` (or asked
+            # explicitly). Logging rather than raising keeps predict_abundances'
+            # documented tolerance of non-growing media intact -- callers detect the
+            # bad row through the NaN/zero growth that _compute_relative_abundance_
+            # from_solution already screens for.
+            self.suboptimal_solution = True
+            logger.error("The %s solution is sub-optimal, with a(n) %s status; the fluxes and "
+                         "abundances derived from it are NOT trustworthy.",
+                         self.util.model.id, solution.status)
+            if dump_diagnostics or (dump_diagnostics is None and self.lp_filename):
+                dumpDir = path.dirname(self.lp_filename) if self.lp_filename else ""
+                try:
+                    self.print_lp(path.join(dumpDir, "erronous_model.lp"))
+                    save_matlab_model(self.util.model, path.join(
+                        dumpDir, f"{self.util.model.name or self.util.model.id}.mat"))
+                except Exception as e:
+                    logger.warning("Could not dump diagnostics for %s: %s", self.util.model.id, e)
+        else:  self.suboptimal_solution = False
         self.solution = solution
         self.exchange_fluxes = {ex.id: self.solution.fluxes[ex.id] for ex in self.util.model.reactions if "EX_" in ex.id}
         self._comm_growth()
@@ -729,6 +829,17 @@ class MSCommunity:
         results = self.solve_batch(instances, backend=backend, workers=workers)
         solo = {}
         for r in results:
+            # The status is the ONLY trustworthy signal here: on a non-optimal solve
+            # GLPK leaves the objective expression evaluated at the STALE incumbent of
+            # whatever was solved before (a positive number), while Gurobi returns
+            # None -- so reading objective_value alone made the recorded solo capacity
+            # solver-dependent garbage. Anything not optimal means "no capacity".
+            if r.status != "optimal":
+                logger.warning("The solo-capacity LP of %s in %s is %s; recording zero capacity "
+                               "(its objective_value %r is not meaningful).",
+                               r.id, self.util.model.id, r.status, r.objective_value)
+                solo[r.id] = 0
+                continue
             v = r.objective_value
             solo[r.id] = v if (v is not None and not isnan(v) and v > 1e-6) else 0
         return solo

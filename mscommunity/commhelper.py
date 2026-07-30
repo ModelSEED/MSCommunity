@@ -16,7 +16,10 @@ from numpy import mean
 import re
 
 import logging
-logging.basicConfig(filename='example.log', encoding='utf-8', level=logging.WARNING)
+
+# No basicConfig here: importing a library must not reconfigure the root logger
+# or create files in the caller's working directory. Configuring logging is the
+# application's decision, so we only take our own named logger.
 logger = logging.getLogger(__name__)
 
 
@@ -208,6 +211,22 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     elif hasattr(newutl.model, "notes"):
         newutl.model.notes.update({"member_biomass_cpds": member_biomasses, "modelIndex_names": model_tracking})
     # print([cons.name for cons in newutl.model.constraints])
+
+    # Cross-feeding can only happen through a shared extracellular compartment.
+    # An ID the ModelSEED parser cannot resolve is defaulted to the member's own
+    # cytosol, so a member model in a foreign namespace merges "successfully"
+    # into a community whose members have no extracellular pool in common and
+    # therefore cannot exchange anything. That is silent today, so check for it.
+    shared_ex_mets = [met for met in newutl.model.metabolites if met.compartment == "e0"]
+    if not shared_ex_mets:
+        logger.warning(
+            "The assembled community %s has no metabolite in the shared extracellular "
+            "compartment 'e0', so no cross-feeding is possible. This usually means the "
+            "member models are not in the ModelSEED namespace and were not reconciled "
+            "before assembly; compartments present are %s.",
+            newutl.model.id, sorted({met.compartment for met in newutl.model.metabolites}))
+        print(f"WARNING: {newutl.model.id} has no shared 'e0' compartment; members cannot cross-feed.")
+
     if MSmodel:   return newutl
     return newutl.model
 
@@ -344,9 +363,17 @@ def phenotypes(community_members, phenotype_flux_threshold=.1, solver:str="glpk"
             sol_dict = FBAHelper.solution_to_variables_dict(pheno_sol, pheno_util.model)
             simulated_growth = sum([flux for var, flux in sol_dict.items() if re.search(r"(^bio\d+$)", var.name)])
             if not isclose(simulated_growth, min_growth):
-                display([(rxn, flux) for rxn, flux in pheno_sol.fluxes.items() if "EX_" in rxn and flux != 0])
+                # `display` is an IPython builtin; calling it here raised NameError
+                # outside a notebook and masked the ObjectiveError below, which is
+                # the diagnostic the caller actually needs. Carry the exchange
+                # fluxes in the message instead.
+                nonzero_exchanges = {rxn: flux for rxn, flux in pheno_sol.fluxes.items()
+                                     if "EX_" in rxn and flux != 0}
+                logger.warning("Nonzero exchanges for the failed %s phenotype: %s",
+                               phenoRXN.id, nonzero_exchanges)
                 raise ObjectiveError(f"The assigned minimal_growth of {min_growth} was not optimized"
-                                     f" during the simulation, where the observed growth was {simulated_growth}.")
+                                     f" during the simulation, where the observed growth was {simulated_growth}."
+                                     f" Nonzero exchange fluxes: {nonzero_exchanges}")
 
             ## store solution fluxes and update the community_members phenotypes
             met_name = strip_comp(name).replace(" ", "-")
