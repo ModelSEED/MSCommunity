@@ -16,6 +16,15 @@ import graphviz
 import os, re
 
 
+def _compartment_index(rxn):
+    """The numeric suffix of a reaction compartment, or None when the compartment is
+    undefined (e.g. a reaction without metabolites) or lacks a numeric suffix (e.g. "c")."""
+    compartment = FBAHelper.rxn_compartment(rxn)
+    if not compartment:  return None
+    try:    return int(compartment[1:])
+    except (ValueError, TypeError):  return None
+
+
 def add_collection_item(met_name, normalized_flux, flux_threshold, ignore_mets,
                         species_collection, first, second):
     if flux_threshold and normalized_flux <= flux_threshold:  return species_collection
@@ -26,37 +35,65 @@ def add_collection_item(met_name, normalized_flux, flux_threshold, ignore_mets,
 
 
 @staticmethod
-def run_fba(mscommodel, media, pfba=False, fva_reactions=None, ava=False, minMemGrwoth:float=1, interactions=True):
+def run_fba(mscommodel, media, pfba=False, fva_reactions=None, ava=False, minMemGrwoth:float=0,
+            compute_interactions=True):
+    """Simulate the community, optionally under the SteadyCom member-growth floor.
 
+    `minMemGrwoth` defaults to 0, i.e. no floor. Historically this argument
+    defaulted to 1 but was applied by assigning an attribute to a cobra
+    Metabolite, which has no effect on the LP — so every caller of this function
+    has in fact been running WITHOUT a floor. Enforcing one by default now would
+    silently change every existing caller's results, so the floor is opt-in:
+    pass a positive `minMemGrwoth` to apply
 
-    # minGrowth = Constraint(name="minMemGrowth", lb=, ub=None)
-    # mscommodel.model.add_cons_vars
+        bio_f,i - bio_r,i >= minMemGrwoth   for every member i.
 
+    The floor is installed inside the model's context manager, so it is removed
+    again when this function returns rather than leaking onto the caller's model.
+    """
     # fix member abundances
     if not mscommodel.abundances_set:
-        for member in mscommodel.members:
-            member.biomass_cpd.lb = minMemGrwoth
         all_metabolites = {mscommodel.primary_biomass.products[0]: 1}
         all_metabolites.update({mem.biomass_cpd: 1 / len(mscommodel.members) for mem in mscommodel.members})
         mscommodel.primary_biomass.add_metabolites(all_metabolites, combine=False)
     # TODO constrain fluxes to be proportional to the relative abundance
-
     # TODO constrain the sum of fluxes to be proportional with the abundance
-    sol = mscommodel.run_fba(media, pfba, fva_reactions)
-    if interactions:  return interactions(mscommodel, sol)
-    if ava:  return abundance_variability_analysis(mscommodel, sol)
+
+    with mscommodel.util.model:
+        if minMemGrwoth:
+            for member in mscommodel.members:
+                if member.primary_biomass is None:  raise ParameterError(
+                    f"The {member.id} member lacks a primary biomass reaction,"
+                    f" hence the {minMemGrwoth} minimal growth cannot be enforced.")
+                consName = f"{member.id}_minMemGrowth"
+                ## remove an existing instance of the constraint, which permits repeated simulations
+                if consName in mscommodel.util.model.constraints:
+                    mscommodel.util.model.remove_cons_vars(mscommodel.util.model.constraints[consName])
+                coef = {member.primary_biomass.forward_variable: 1,
+                        member.primary_biomass.reverse_variable: -1}
+                mscommodel.util.create_constraint(mscommodel.util.model.problem.Constraint(
+                    Zero, name=consName, lb=minMemGrwoth, ub=None), coef=coef)
+
+        sol = mscommodel.run_fba(media, pfba, fva_reactions)
+        ## the variability range is only meaningful while the floor is installed
+        if ava:  return abundance_variability_analysis(mscommodel, media)
+
+    if compute_interactions:  return interactions(mscommodel, sol)
+    return sol
 
 @staticmethod
-def abundance_variability_analysis(mscommodel, media):
+def abundance_variability_analysis(mscommodel, media=None):
     variability = {}
     for mem in mscommodel.members:
         variability[mem.id] = {}
         # minimal variability
-        mscommodel.set_objective(mem.biomasses, minimize=True)
-        variability[mem.id]["minVar"] = mscommodel.run_fba(media)
+        mscommodel.set_objective(target=mem.primary_biomass.id, minimize=True)
+        variability[mem.id]["minVar"] = mscommodel.run_fba(media).fluxes[mem.primary_biomass.id]
         # maximal variability
-        mscommodel.set_objective(mem.biomasses, minimize=False)
-        variability[mem.id]["maxVar"] = mscommodel.run_fba(media)
+        mscommodel.set_objective(target=mem.primary_biomass.id, minimize=False)
+        variability[mem.id]["maxVar"] = mscommodel.run_fba(media).fluxes[mem.primary_biomass.id]
+    # restore the community biomass objective
+    mscommodel.set_objective()
     return variability
 
 @staticmethod
@@ -115,7 +152,8 @@ def interactions(
             cpd = list(rxn.metabolites.keys())[0]
             # the Environment takes the opposite perspective to the members
             metabolite_data[cpd.id]["Environment"] += -solution.fluxes[rxn.id]
-        rxn_index = int(FBAHelper.rxn_compartment(rxn)[1:])
+        rxn_index = _compartment_index(rxn)
+        if rxn_index is None:  continue
         if not any([met not in exchange_mets_list for met in rxn.metabolites]
                     ) or rxn_index not in species_list:  continue
         for met in rxn.metabolites:
@@ -234,7 +272,6 @@ def visual_interactions(cross_feeding_df, filename="cross_feeding", export_forma
             if negative and positive:  cross_feeding_rows.append(row)  ;  break
     metabolites_df = concat(cross_feeding_rows, axis=1).T
     metabolites_df.index.name = "Metabolite ID"
-    display(metabolites_df)
     metabolites = [msdb.compounds.get_by_id(metID.replace("_e0", "")) for metID in metabolites_df.index.tolist()
                     if metID not in ["cpdETCM", "cpdETCMe"]]
     # define the community members that participate in cross-feeding
@@ -249,32 +286,39 @@ def visual_interactions(cross_feeding_df, filename="cross_feeding", export_forma
     ## top-layer members
     # TODO hyperlink the member nodes with their Narrative link
     dot.attr('node', shape='rectangle', color="lightblue2", style="filled")
-    for mem in members_cluster1:
-        index = members.index(mem)
-        dot.node(f"S{index}", mem)
+    with dot.subgraph(name="members_top") as members_subgraph:
+        members_subgraph.attr(rank="same")
+        for mem in members_cluster1:
+            index = members.index(mem)
+            members_subgraph.node(f"S{index}", mem)
     ## mets in the middle layer
+    ### the node ID must be unique -- distinct from the abbreviated label -- lest metabolites
+    ### that share a three-character abbreviation prefix collapse into a single node
+    met_nodes = {met.id: f"M{metIndex}" for metIndex, met in enumerate(metabolites)}
     with dot.subgraph(name="mets") as mets_subgraph:
         mets_subgraph.attr(rank="same")
         mets_subgraph.attr('node', shape='circle', color="green", style="filled")
         for metIndex, met in enumerate(metabolites):
-            mets_subgraph.node(met.abbr[:3], fixedsize="true", height="0.4", tooltip=f"{met.id} ; {met.name}",
+            mets_subgraph.node(met_nodes[met.id], met.abbr[:3], fixedsize="true", height="0.4",
+                                tooltip=f"{met.id} ; {met.name}",
                                 URL=f"https://modelseed.org/biochem/compounds/{met.id}")
     ## bottom-layer members
-    with dot.subgraph(name="members") as members_subgraph:
+    with dot.subgraph(name="members_bottom") as members_subgraph:
         members_subgraph.attr(rank="same")
         for mem in members_cluster2:
             index = members.index(mem)
-            dot.node(f"S{index}", mem)
+            members_subgraph.node(f"S{index}", mem)
     # define the edges by parsing the interaction DataFrame
     for met in metabolites:
         row = metabolites_df.loc[met.id]
         maxVal = max(list(row.to_numpy()))
+        metNode = met_nodes[met.id]
         for col, val in row.items():
             if col == "Environment":  continue
             index = members.index(col)
             # TODO color carbon sources red
-            if val > 0:  dot.edge(f"S{index}", met.abbr[:3], arrowsize=f"{val / maxVal}", edgetooltip=str(val))
-            if val < 0:  dot.edge(met.abbr[:3], f"S{index}", arrowsize=f"{abs(val / maxVal)}", edgetooltip=str(val))
+            if val > 0:  dot.edge(f"S{index}", metNode, arrowsize=f"{val / maxVal}", edgetooltip=str(val))
+            if val < 0:  dot.edge(metNode, f"S{index}", arrowsize=f"{abs(val / maxVal)}", edgetooltip=str(val))
 
     # render and export the source
     dot.render(filename, view=view_figure)
