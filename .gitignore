@@ -3,3 +3,11 @@ MSCommunity.egg-info/*
 */__pycache__/*
 */__pycache__
 mscommunity/__pycache__/__init__.cpython-312.pyc
+
+# the patterns above only reach one directory deep, so nested packages
+# (mscommunity/backends, tests) leaked their caches into `git status`
+**/__pycache__/
+*.pyc
+
+# Claude Code local settings and scratch worktrees
+.claude/

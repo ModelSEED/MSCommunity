@@ -5,8 +5,6 @@ from setuptools import setup, find_packages
 # with open("README.rst") as f:
 #     readme = f.read()
 
-# with open("LICENSE") as f:
-#     license = f.read()
 
 setup(
     name="mscommunity",
@@ -17,13 +15,15 @@ setup(
     author="Andrew Freiburger",
     author_email="afreiburger@anl.gov",
     url="https://github.com/ModelSEED/MSCommunity",
-    # license=license,
+    license="MIT",
+    license_files=("LICENSE",),
     packages=find_packages(),
     # package_data={
     #     "modelseedpy": ["config.cfg", "community/*.html", "core/*.html", "data/*", "data/categories/*", "data/templates/*"],
     # },
     classifiers=[
         "Development Status :: 3 - Alpha",
+        "License :: OSI Approved :: MIT License",
         "Topic :: Scientific/Engineering :: Bio-Informatics",
         "Intended Audience :: Science/Research",
         "Operating System :: OS Independent",
