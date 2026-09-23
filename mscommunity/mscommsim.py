@@ -7,7 +7,7 @@ from modelseedpy.core.fbahelper import FBAHelper
 #from modelseedpy.fbapkg.gapfillingpkg import default_blacklist
 from modelseedpy.core.msatpcorrection import MSATPCorrection
 from mscommunity.commhelper import build_from_species_models
-from mscommunity.commkineticpkg import CommKineticPkg
+from mscommunity.commkineticpkg import CommKineticPkg, member_kinetic_reactions
 from mscommunity.mscommviz import interactions as mscommsim_interactions
 from mscommunity.batched_lp import (
     BatchedSolution,
@@ -107,18 +107,38 @@ class CommunityMember:
         self.biomass_drain = self.primary_biomass = None
         if not model:
             self.reactions = []
+        # Classify every reaction of the community model against this member.
+        #
+        # Two defects used to live here.  (1) The biomass-drain test sat inside an
+        # `if "bio" in rxn.id` branch, so a drain named by the ModelSEED convention
+        # -- SK_cpd11416_c<i>, which is what build_from_species_models carries over
+        # from the member models -- was never recognised, and the constructor then
+        # built a REDUNDANT DM_cpd11416_c<i> beside it.  (2) The loop `break`ed as
+        # soon as the primary biomass was found, so every reaction after it was left
+        # unclassified: the drain (which follows bio<i> by three positions in a
+        # ModelSEED community model) could not be seen even in principle, and
+        # `self.reactions` -- and therefore the member's standalone `self.model` --
+        # was silently truncated to whatever preceded the biomass reaction.
         for rxn in self.community.util.model.reactions:
-            if "bio" in rxn.id:
-                mets = {met.id: met for met in rxn.metabolites}
-                if self.biomass_cpd.id not in mets:   continue
+            mets = {met.id: met for met in rxn.metabolites}
+            if self.biomass_cpd.id in mets:
                 met = mets[self.biomass_cpd.id]
-                if rxn.metabolites[met] == 1 and len(rxn.metabolites) > 1:  self.primary_biomass = rxn  ;  break
-                elif len(rxn.metabolites) == 1 and rxn.metabolites[met] < 0:  self.biomass_drain = rxn
-            else:
-                rxnComp = FBAHelper.rxn_compartment(rxn)
-                if rxnComp is None:  print(f"The reaction {rxn.id} compartment {rxnComp} is undefined.")
-                elif rxnComp[1:] == '': print("no compartment", rxn, rxnComp)
-                elif int(rxnComp[1:]) == self.index:  self.reactions.append(rxn)
+                ## this member's own biomass reaction produces one unit of its biomass
+                if rxn.metabolites[met] == 1 and len(rxn.metabolites) > 1:
+                    self.primary_biomass = rxn
+                    continue
+                ## a drain on this member's biomass: a boundary reaction that consumes
+                ## it and nothing else, whatever prefix it happens to carry
+                if len(rxn.metabolites) == 1 and rxn.metabolites[met] < 0:
+                    self.biomass_drain = rxn
+                    continue
+            ## biomass reactions (this member's, another member's, or the community's)
+            ## never count as member metabolism
+            if "bio" in rxn.id:  continue
+            rxnComp = FBAHelper.rxn_compartment(rxn)
+            if rxnComp is None:  print(f"The reaction {rxn.id} compartment {rxnComp} is undefined.")
+            elif rxnComp[1:] == '': print("no compartment", rxn, rxnComp)
+            elif int(rxnComp[1:]) == self.index:  self.reactions.append(rxn)
 
         if self.primary_biomass is None:  print(f"No biomass reaction found for species {self.id}")
         if not self.biomass_drain:
@@ -127,6 +147,10 @@ class CommunityMember:
             self.community.util.model.add_reactions([self.biomass_drain])
             self.biomass_drain.add_metabolites({self.biomass_cpd: -1})
             self.biomass_drain.annotation["sbo"] = 'SBO:0000627'
+        # the drain's as-built bounds, kept so that MSCommunity can close the drain for
+        # the coupled community solve and still restore it where a member is measured
+        # on its own (see MSCommunity._solo_max_batch)
+        self.biomass_drain_bounds = tuple(self.biomass_drain.bounds)
         # reactions = self.reactions + [self.primary_biomass, self.biomass_drain]
         # print(Counter([rxn.id for rxn in reactions]))
         # TODO the best way of tracking the models may be to run build_from_species_models inside the MSCommunity class
@@ -156,11 +180,30 @@ class CommunityMember:
 
 class MSCommunity:
     def __init__(self, model=None, member_models: list = None, abundances=None, ids=None, kinetic_coeff=750,
-                 flux_limit=300, probs=None, climit=None, o2limit=None, lp_filename=None, printing=False, eleLimits=None, ID=None):
+                 flux_limit=300, probs=None, climit=None, o2limit=None, lp_filename=None, printing=False, eleLimits=None, ID=None,
+                 close_member_drains=False):
         # `flux_limit` is UNUSED: nothing in the package reads it. It is kept only so
         # existing positional/keyword callers do not break; pass it or not, it has no
         # effect. `probs` was a mutable {} default shared by every instance (mutating
         # one community's rxnProbs would silently edit the default) -> None sentinel.
+        #
+        # `close_member_drains` shuts each member's biomass drain, so member biomass can
+        # leave only through bio1 and every member's growth is pinned to
+        # abundance * bio1. An open drain lets a member synthesise biomass and discard
+        # it, so its own biomass flux exceeds abundance * bio1 and the CommKinetics
+        # right-hand side (kinetic_coef * member biomass) inflates with it: each unit
+        # drained buys (kinetic_coef - 1) units of flux budget. Measured on a two-member
+        # SynCom, 83% of one member's biomass went out the drain at the lowest feasible
+        # kinetic coefficient, and closing the drains raised that coefficient from 1285
+        # to 1481.
+        #
+        # It defaults to False because the drain is load-bearing elsewhere in this
+        # class: `_solo_max_batch` and `predict_abundances*` deliberately let a member
+        # grow while the others are switched off, which zeroes bio1 and leaves the drain
+        # as the only outlet for that member's biomass. (`_solo_max_batch` reopens the
+        # target's drain for its own LPs, so it works either way.) Set it True whenever
+        # the declared abundance vector is meant to BIND -- any run where you read
+        # member growth rates or a kinetic coefficient off the solution.
         assert model is not None or member_models is not None, "Either the community model and the member models must be defined."
         probs = probs if probs is not None else {}
         self.lp_filename = lp_filename
@@ -221,7 +264,7 @@ class MSCommunity:
                     met = _select_biomass_cpd(bioCPDs, memberBioCPDs, allModelCPDs)
                     if met is None:   print(f"The {memID} bioCPD was not captured")
                     else:  abundances[memID].update({"biomass_compound": met})
-        elif "abundance" not in list(abundances.values())[0]:
+        elif not isinstance(list(abundances.values())[0], dict):  # plain floats ("abundance" in <float> raised TypeError)
             abundances = {memID:{"abundance": abund,
                                  "biomass_compound": _select_biomass_cpd(
                                      model.notes["member_biomass_cpds"][memID], memberBioCPDs, allModelCPDs)}
@@ -234,6 +277,13 @@ class MSCommunity:
         #     CommunityMember(community=self, biomass_cpd=biomass_cpd, name=ids[memIndex], abundance=abundances[memIndex])
         #     for memIndex, biomass_cpd in enumerate(other_biomass_cpds))
         self.set_abundance(abundances)
+
+        # close the member biomass drains (see the note in the docstring above)
+        self.close_member_drains = close_member_drains
+        if close_member_drains:
+            for member in self.members:
+                if member.biomass_drain is not None:
+                    member.biomass_drain.bounds = (0, 0)
 
         # assign the MSCommunity constraints and objective
         self.rxnProbs = probs
@@ -291,12 +341,14 @@ class MSCommunity:
             if consName in self.util.model.constraints:
                 print(f"Removing {consName} from {self.util.model.id}")
                 self.util.model.remove_cons_vars(self.util.model.constraints[consName])
-            ## define the CommKinetics constraint:  kinCoef * bio_f,i > kinCoef * bio_r,i + sum(rxn_i * prob_r) 
+            ## define the CommKinetics constraint:  kinCoef * bio_f,i > kinCoef * bio_r,i + sum(rxn_i * prob_r)
+            ## membership comes from commkineticpkg.member_kinetic_reactions, the single
+            ## definition shared with CommKineticPkg -- the two used to apply different
+            ## exclusion rules ("bio" not in the id here, identity there), which disagreed
+            ## on the community biomass reaction and on the member biomass drains.
             coef = {member.primary_biomass.forward_variable: -kinCoef, member.primary_biomass.reverse_variable: kinCoef}
-            for rxn in self.util.model.reactions:
-                rxnIndex = int(FBAHelper.rxn_compartment(rxn)[1:])
-                if (rxnIndex == member.index and "bio" not in rxn.id):
-                    coef[rxn.forward_variable] = coef[rxn.reverse_variable] = self.rxnProbs.get(rxn.id, 1)
+            for rxn in member_kinetic_reactions(self, member):
+                coef[rxn.forward_variable] = coef[rxn.reverse_variable] = self.rxnProbs.get(rxn.id, 1)
             self.util.create_constraint(self.util.model.problem.Constraint(Zero, name=consName, ub=0), coef=coef, printing=True)
 
     #Utility functions
@@ -321,8 +373,13 @@ class MSCommunity:
         self.set_objective(target, minimize)
         gfname = FBAHelper.mediaName(media) + "-" + target
         if suffix:  gfname += f"-{suffix}"
+        # MSGapfill's 7th positional is now `atp_gapfilling`, not solver: set the solver
+        # on the model instead of passing it through (a truthy string silently switched
+        # every community gapfill into ATP-gapfilling mode).
+        if solver:
+            self.util.model.solver = solver
         self.gapfillings[gfname] = MSGapfill(self.util.model, default_gapfill_templates, default_gapfill_models,
-                                             test_conditions, reaction_scores, blacklist, solver)
+                                             test_conditions, reaction_scores, blacklist)
         gfresults = self.gapfillings[gfname].run_gapfilling(media, target)
         assert gfresults, f"Gapfilling of {self.util.model.id} in {gfname} towards {target} failed."
         return self.gapfillings[gfname].integrate_gapfill_solution(gfresults)
@@ -820,6 +877,15 @@ class MSCommunity:
             for other in self.members:
                 if other.id != target.id:
                     bounds[other.primary_biomass.id] = (0.0, 0.0)
+            # "Solo" means this member growing without its partners, so its biomass has
+            # to be able to leave the system on its own: zeroing the other members'
+            # biomass also zeroes the community biomass reaction, which is the only
+            # other outlet for this member's biomass compound. Restore its drain for
+            # this LP even when the coupled community model runs with drains closed --
+            # otherwise every solo capacity is 0 and the regularization floors vanish.
+            if target.biomass_drain is not None:
+                bounds[target.biomass_drain.id] = tuple(
+                    getattr(target, "biomass_drain_bounds", (0.0, 1000.0)))
             instances.append(LPInstance(
                 id=target.id,
                 bounds=bounds,
