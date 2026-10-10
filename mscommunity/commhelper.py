@@ -1,4 +1,5 @@
-from modelseedpy.core import minimizeFlux_withGrowth, bioFlux_check, NoFluxError, ObjectiveError
+from modelseedpy.core.msminimalmedia import minimizeFlux_withGrowth, bioFlux_check
+from modelseedpy.core.exceptions import NoFluxError, ObjectiveError
 from modelseedpy.fbapkg.mspackagemanager import MSPackageManager
 from modelseedpy.core.msmodelutl import MSModelUtil
 from modelseedpy.core.fbahelper import FBAHelper
@@ -21,6 +22,58 @@ import logging
 # or create files in the caller's working directory. Configuring logging is the
 # application's decision, so we only take our own named logger.
 logger = logging.getLogger(__name__)
+
+
+def isnumber(string):
+    """Port of modelseedpy's isnumber, which is no longer an FBAHelper member.
+
+    Copied verbatim from modelseedpy/community/datastandardization.py so this
+    module does not import modelseedpy's superseded community package.
+    """
+    try:
+        float(string)
+    except Exception:
+        return False
+    return True
+
+
+def make_model_util(model, copy=False, environment=None, climit=None, o2limit=None):
+    """Construct MSModelUtil across ModelSEEDpy signature variants.
+
+    MSCommunity was written against a ModelSEEDpy whose ``MSModelUtil.__init__``
+    accepted ``copy``/``environment``/``climit``/``o2limit``. The installed
+    ModelSEEDpy may accept only ``model``, so each argument is forwarded ONLY if
+    the installed signature has it.
+
+    ``copy`` is honoured locally when unsupported -- dropping it would make
+    MSCommunity mutate the caller's models in place. The remaining arguments
+    cannot be emulated, so a non-default value RAISES rather than being dropped:
+    silently ignoring an uptake limit would yield unconstrained fluxes that look
+    plausible.
+    """
+    import inspect
+
+    params = inspect.signature(MSModelUtil.__init__).parameters
+    kwargs = {}
+
+    if "copy" in params:
+        kwargs["copy"] = copy
+    elif copy:
+        copied = model.copy()
+        copied.objective = model.objective
+        model = copied
+
+    for name, value in (("environment", environment), ("climit", climit), ("o2limit", o2limit)):
+        if name in params:
+            kwargs[name] = value
+        elif value is not None:
+            raise NotImplementedError(
+                f"MSCommunity requested {name}={value!r} but the installed "
+                f"ModelSEEDpy's MSModelUtil does not support it. Dropping it "
+                f"would silently change the simulation, so this is refused."
+            )
+
+    return MSModelUtil(model, **kwargs)
 
 
 def strip_comp(ID):
@@ -152,15 +205,21 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
                     name, compartment, index = output
                     if compartment != "e":
                         rxn.name = f"{name}_{compartment}{model_index}"
-                        rxn_id = re.search(r"(.+\_\w)(?=\d+)", rxn.id).group()
+                        # The lookahead below can only match an id that ENDS in
+                        # digits, so it must not be evaluated on the `index == ""`
+                        # branch -- which does not use it and which non-ModelSEED
+                        # ids always take. Evaluating it eagerly raised
+                        # AttributeError on .group() for every such id.
                         if index == "":  rxn.id += str(model_index)
-                        else:  rxn.id = rxn_id + str(model_index)
+                        else:
+                            rxn_id = re.search(r"(.+\_\w)(?=\d+)", rxn.id).group()
+                            rxn.id = rxn_id + str(model_index)
                 finalID = str(rxn.id)
                 string_diff = ""
                 for index, let in enumerate(finalID):
                     if index >= len(initialID) or index < len(initialID) and let != initialID[index]: string_diff += let
                 # if "compartment" not in locals():  print(f"the {rxn.id} with a {output} output is not defined with a compartment.")
-                if string_diff != f"_{compartment}{model_index}" or not FBAHelper.isnumber(string_diff) and printing:
+                if string_diff != f"_{compartment}{model_index}" or not isnumber(string_diff) and printing:
                     logger.debug(f"The ID {initialID} is changed with {string_diff} to create the final ID {finalID}")
             new_reactions.add(rxn)
         # else:
@@ -221,7 +280,7 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     newmodel.add_reactions(sorted(FBAHelper.filter_cobra_set(new_reactions), key=lambda r: r.id))
     newmodel.add_metabolites(sorted(FBAHelper.filter_cobra_set(new_metabolites), key=lambda m: m.id))
     newmodel.add_reactions([comm_biorxn])
-    newutl = MSModelUtil(newmodel, False, climit=climit, o2limit=o2limit)
+    newutl = make_model_util(newmodel, copy=False, climit=climit, o2limit=o2limit)
     newutl.add_objective(comm_biorxn.flux_expression)
     newutl.model.add_boundary(comm_biomass, "sink") # Is a sink reaction for reversible cpd11416_c0 consumption necessary?
     ##TODO proportionally limit the fluxes to their abundances
@@ -269,7 +328,7 @@ def phenotypes(community_members, phenotype_flux_threshold=.1, solver:str="glpk"
         print("\n", org_model.id)
         org_model.solver = solver
         all_phenotypes = "phenotypes" not in content
-        model_util = MSModelUtil(org_model, True)
+        model_util = make_model_util(org_model, copy=True)
         if "org_coef" not in locals():
             org_coef = {model_util.model.reactions.get_by_id("EX_cpd00007_e0").reverse_variable: -1}
         model_util.standard_exchanges()
@@ -288,7 +347,7 @@ def phenotypes(community_members, phenotype_flux_threshold=.1, solver:str="glpk"
         media.update({"EX_cpd11640_e0": 0})
         past_phenoRXNs = []
         for name, phenoCPDs in phenotypes.items():
-            pheno_util = MSModelUtil(model_util.model, True)
+            pheno_util = make_model_util(model_util.model, copy=True)
             metID = phenoCPDs["consumed"][0]
             try:
                 phenoRXN = pheno_util.model.reactions.get_by_id(f'EX_{metID}_e0')

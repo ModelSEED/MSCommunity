@@ -6,7 +6,7 @@ from modelseedpy.core.msgapfill import MSGapfill
 from modelseedpy.core.fbahelper import FBAHelper
 #from modelseedpy.fbapkg.gapfillingpkg import default_blacklist
 from modelseedpy.core.msatpcorrection import MSATPCorrection
-from mscommunity.commhelper import build_from_species_models
+from mscommunity.commhelper import build_from_species_models, make_model_util
 from mscommunity.commkineticpkg import CommKineticPkg, member_kinetic_reactions
 from mscommunity.mscommviz import interactions as mscommsim_interactions
 from mscommunity.batched_lp import (
@@ -227,7 +227,7 @@ class MSCommunity:
             model = build_from_species_models(member_models, abundances=abundances, printing=printing)
         self.id = ID or model.id
         # self.modelID_names = model.notes["modelID_names"]
-        self.util = MSModelUtil(model, True, None, climit, o2limit)
+        self.util = make_model_util(model, copy=True, environment=None, climit=climit, o2limit=o2limit)
         msid_cobraid_hash = self.util.msid_hash()  # dict of list() of metabolite objects by their msid
         if "cpd11416" not in msid_cobraid_hash:  raise KeyError("Could not find biomass compound for the model.")
         other_biomass_cpds = []
@@ -371,7 +371,7 @@ class MSCommunity:
         reaction_scores = reaction_scores or {}
         if not target:  target = self.primary_biomass.id
         self.set_objective(target, minimize)
-        gfname = FBAHelper.mediaName(media) + "-" + target
+        gfname = FBAHelper.medianame(media) + "-" + target
         if suffix:  gfname += f"-{suffix}"
         # MSGapfill's 7th positional is now `atp_gapfilling`, not solver: set the solver
         # on the model instead of passing it through (a truthy string silently switched

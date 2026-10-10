@@ -16,6 +16,7 @@ from datetime import date
 from math import inf, isnan, isinf
 import pandas
 import json, re, os
+from mscommunity.commhelper import isnumber
 
 def _x_axis_determination(total_time):
     time = total_time * minute
@@ -245,10 +246,10 @@ class MSKineticsFBA:
     def __find_data_match(self, rxnID: str, source: str):
         # identifies the datum whose experimental conditions most closely matches the simulation conditions
         temperature_deviation = ph_deviation = 0
-        if FBAHelper.isnumber(self.kinetics_data[rxnID][source]["metadata"]["Temperature"]):
+        if isnumber(self.kinetics_data[rxnID][source]["metadata"]["Temperature"]):
             temp = float(self.kinetics_data[rxnID][source]["metadata"]["Temperature"])
             temperature_deviation = (abs(self.parameters["temperature"] - temp) / self.parameters["temperature"])
-        if FBAHelper.isnumber(self.kinetics_data[rxnID][source]["metadata"]["pH"]):
+        if isnumber(self.kinetics_data[rxnID][source]["metadata"]["pH"]):
             pH = float(self.kinetics_data[rxnID][source]["metadata"]["pH"])
             ph_deviation = (abs(self.parameters["pH"] - pH) / self.parameters["pH"])
 
