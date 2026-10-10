@@ -1,5 +1,5 @@
 from modelseedpy.core.msminimalmedia import minimizeFlux_withGrowth, bioFlux_check
-from modelseedpy.core.exceptions import NoFluxError, ObjectiveError
+from modelseedpy.core.exceptions import NoFluxError, ObjectiveError, ModelError
 from modelseedpy.fbapkg.mspackagemanager import MSPackageManager
 from modelseedpy.core.msmodelutl import MSModelUtil
 from modelseedpy.core.fbahelper import FBAHelper
@@ -35,6 +35,150 @@ def isnumber(string):
     except Exception:
         return False
     return True
+
+
+class CompatModelUtil(MSModelUtil):
+    """MSModelUtil plus the members MSCommunity needs that cshenry/ModelSEEDpy lacks.
+
+    MSCommunity was written against the ``freiburgermsu/ModelSEEDpy`` lineage,
+    whose ``MSModelUtil`` carries a larger surface than the ``cshenry/ModelSEEDpy``
+    tree KBUtilLib builds on. Rather than fork ModelSEEDpy or run a second
+    lineage, the missing members are restored here as a subclass.
+
+    Every method below is a faithful port of the freiburgermsu implementation
+    (branch ``MSpy_freiburgermsu``), with two DELIBERATE deviations, both noted
+    at their site:
+
+    * ``Objective``/``Constraint`` are taken from ``self.model.problem`` rather
+      than imported from optlang directly, so they bind to the model's own
+      solver interface. This is cobra-idiomatic and strictly safer.
+    * ``remove_constraint`` has no freiburgermsu counterpart; its contract is
+      derived from its call sites (remove the named constraint if present).
+
+    Nothing here invents modelling semantics: no uptake limit, objective or
+    constraint is synthesised where the original did not define one.
+    """
+
+    # -- set / list helpers ----------------------------------------------
+    def metabolites_set(self, reactions_set=None, ids=False):
+        rxns = reactions_set or self.model.reactions
+        if ids:
+            return {met.id for rxn in rxns for met in rxn.metabolites}
+        return {met for rxn in rxns for met in rxn.metabolites}
+
+    def exchange_mets_list(self):
+        return self.metabolites_set(self.exchange_list())
+
+    def carbon_exchange_list(self, include_unknown=True):
+        if not include_unknown:
+            return [ex for ex in self.exchange_list() if "C" in ex.reactants[0].elements]
+        return [ex for ex in self.exchange_list()
+                if not ex.reactants[0].elements or "C" in ex.reactants[0].elements]
+
+    def carbon_exchange_mets_list(self, include_unknown=True):
+        return self.metabolites_set(self.carbon_exchange_list(include_unknown))
+
+    def standard_exchanges(self):
+        for ex in self.exchange_list():
+            if len(ex.reactants) != 1 and len(ex.products) != 0:
+                raise ModelError(
+                    f"The ex {ex.id} possesses {len(ex.reactants)} reactants and "
+                    f"{len(ex.products)} products, which are non-standard and are "
+                    f"incompatible with various ModelSEED operations.")
+
+    # -- constraint / variable plumbing ----------------------------------
+    def add_cons_vars(self, vars_cons, sloppy=False):
+        self.model.add_cons_vars(vars_cons, sloppy=sloppy)
+        self.model.solver.update()
+
+    def remove_cons_vars(self, vars_cons):
+        self.model.remove_cons_vars(vars_cons)
+        self.model.solver.update()
+
+    def create_constraint(self, constraint, coef=None, sloppy=False):
+        self.model.add_cons_vars(constraint, sloppy=sloppy)
+        self.model.solver.update()
+        if coef:
+            constraint.set_linear_coefficients(coef)
+            self.model.solver.update()
+
+    def remove_constraint(self, name):
+        """Remove the constraint called ``name`` if the model carries it.
+
+        DERIVED contract -- freiburgermsu has no such method. Every call site in
+        MSCommunity passes a constraint NAME and fires unconditionally after
+        optional construction, so this is a no-op when the name is unknown
+        rather than an error.
+        """
+        constraint = None
+        try:
+            if name in self.model.constraints:
+                constraint = self.model.constraints[name]
+        except Exception:
+            constraint = None
+        if constraint is None:
+            return False
+        self.model.remove_cons_vars([constraint])
+        self.model.solver.update()
+        return True
+
+    # -- objective -------------------------------------------------------
+    def add_objective(self, objective, direction="max", coef=None):
+        # DEVIATION: self.model.problem.Objective, not optlang.Objective, so the
+        # objective is built against this model's own solver interface.
+        self.model.objective = self.model.problem.Objective(objective, direction=direction)
+        self.model.solver.update()
+        if coef:
+            self.model.objective.set_linear_coefficients(coef)
+            self.model.solver.update()
+
+    def add_minimal_objective_cons(self, min_value=0.1, objective_expr=None):
+        if "min_value" not in self.model.constraints:
+            objective_expr = objective_expr or self.model.objective.expression
+            # DEVIATION: self.model.problem.Constraint, per add_objective above.
+            self.create_constraint(self.model.problem.Constraint(
+                objective_expr, lb=min_value, ub=None, name="min_value"))
+        else:
+            self.model.constraints["min_value"].lb = min_value
+
+    # -- media / simulation ----------------------------------------------
+    def add_medium(self, media, uniform_uptake=None):
+        if media is None:
+            return self.model.medium
+        exIDs = [exRXN.id for exRXN in self.exchange_list()]
+        if not hasattr(media, "items"):
+            # Port of FBAHelper.convert_kbase_media, absent from the installed
+            # ModelSEEDpy. Verbatim from the freiburgermsu lineage: the uptake
+            # bound is the NEGATED lower bound, which matches cobra's
+            # model.medium convention of positive uptake magnitudes.
+            if not hasattr(media, "get_media_constraints"):
+                raise NotImplementedError(
+                    "add_medium received a medium that is neither a mapping nor "
+                    "an MSMedia (no get_media_constraints); it cannot be "
+                    "converted, and applying NO medium instead would silently "
+                    "leave the model unconstrained. Pass an "
+                    "{exchange_id: uptake} mapping.")
+            constraints = media.get_media_constraints()
+            if uniform_uptake is None:
+                media = {"EX_" + exID: -bound[0] for exID, bound in constraints.items()}
+            else:
+                media = {"EX_" + exID: uniform_uptake for exID in constraints}
+        self.model.medium = {ex: uptake for ex, uptake in media.items() if ex in exIDs}
+        if uniform_uptake is not None:
+            self.model.medium = dict(zip(list(self.model.medium.keys()),
+                                         [uniform_uptake] * len(self.model.medium)))
+        return self.model.medium
+
+    def run_fba(self, media=None, pfba_flag=False, fva_reactions=None):
+        from cobra import flux_analysis
+        if media:
+            self.pkgmgr.getpkg("KBaseMediaPkg").build_package(media)
+        if pfba_flag:
+            return flux_analysis.pfba(self.model)
+        if fva_reactions is not None:
+            return flux_analysis.variability.flux_variability_analysis(
+                self.model, fva_reactions)
+        return self.model.optimize()
 
 
 def make_model_util(model, copy=False, environment=None, climit=None, o2limit=None):
@@ -73,7 +217,7 @@ def make_model_util(model, copy=False, environment=None, climit=None, o2limit=No
                 f"would silently change the simulation, so this is refused."
             )
 
-    return MSModelUtil(model, **kwargs)
+    return CompatModelUtil(model, **kwargs)
 
 
 def strip_comp(ID):
