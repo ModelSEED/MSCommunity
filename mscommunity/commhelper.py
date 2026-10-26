@@ -1,4 +1,5 @@
-from modelseedpy.core import minimizeFlux_withGrowth, bioFlux_check, NoFluxError, ObjectiveError
+from modelseedpy.core.msminimalmedia import minimizeFlux_withGrowth, bioFlux_check
+from modelseedpy.core.exceptions import NoFluxError, ObjectiveError, ModelError
 from modelseedpy.fbapkg.mspackagemanager import MSPackageManager
 from modelseedpy.core.msmodelutl import MSModelUtil
 from modelseedpy.core.fbahelper import FBAHelper
@@ -21,6 +22,205 @@ import logging
 # or create files in the caller's working directory. Configuring logging is the
 # application's decision, so we only take our own named logger.
 logger = logging.getLogger(__name__)
+
+
+def isnumber(string):
+    """Port of modelseedpy's isnumber, which is no longer an FBAHelper member.
+
+    Copied verbatim from modelseedpy/community/datastandardization.py so this
+    module does not import modelseedpy's superseded community package.
+    """
+    try:
+        float(string)
+    except Exception:
+        return False
+    return True
+
+
+class CompatModelUtil(MSModelUtil):
+    """MSModelUtil plus the members MSCommunity needs that cshenry/ModelSEEDpy lacks.
+
+    MSCommunity was written against the ``freiburgermsu/ModelSEEDpy`` lineage,
+    whose ``MSModelUtil`` carries a larger surface than the ``cshenry/ModelSEEDpy``
+    tree KBUtilLib builds on. Rather than fork ModelSEEDpy or run a second
+    lineage, the missing members are restored here as a subclass.
+
+    Every method below is a faithful port of the freiburgermsu implementation
+    (branch ``MSpy_freiburgermsu``), with two DELIBERATE deviations, both noted
+    at their site:
+
+    * ``Objective``/``Constraint`` are taken from ``self.model.problem`` rather
+      than imported from optlang directly, so they bind to the model's own
+      solver interface. This is cobra-idiomatic and strictly safer.
+    * ``remove_constraint`` has no freiburgermsu counterpart; its contract is
+      derived from its call sites (remove the named constraint if present).
+
+    Nothing here invents modelling semantics: no uptake limit, objective or
+    constraint is synthesised where the original did not define one.
+    """
+
+    # -- set / list helpers ----------------------------------------------
+    def metabolites_set(self, reactions_set=None, ids=False):
+        rxns = reactions_set or self.model.reactions
+        if ids:
+            return {met.id for rxn in rxns for met in rxn.metabolites}
+        return {met for rxn in rxns for met in rxn.metabolites}
+
+    def exchange_mets_list(self):
+        return self.metabolites_set(self.exchange_list())
+
+    def carbon_exchange_list(self, include_unknown=True):
+        if not include_unknown:
+            return [ex for ex in self.exchange_list() if "C" in ex.reactants[0].elements]
+        return [ex for ex in self.exchange_list()
+                if not ex.reactants[0].elements or "C" in ex.reactants[0].elements]
+
+    def carbon_exchange_mets_list(self, include_unknown=True):
+        return self.metabolites_set(self.carbon_exchange_list(include_unknown))
+
+    def standard_exchanges(self):
+        for ex in self.exchange_list():
+            if len(ex.reactants) != 1 and len(ex.products) != 0:
+                raise ModelError(
+                    f"The ex {ex.id} possesses {len(ex.reactants)} reactants and "
+                    f"{len(ex.products)} products, which are non-standard and are "
+                    f"incompatible with various ModelSEED operations.")
+
+    # -- constraint / variable plumbing ----------------------------------
+    def add_cons_vars(self, vars_cons, sloppy=False):
+        self.model.add_cons_vars(vars_cons, sloppy=sloppy)
+        self.model.solver.update()
+
+    def remove_cons_vars(self, vars_cons):
+        self.model.remove_cons_vars(vars_cons)
+        self.model.solver.update()
+
+    def create_constraint(self, constraint, coef=None, sloppy=False, printing=False):
+        self.model.add_cons_vars(constraint, sloppy=sloppy)
+        self.model.solver.update()
+        if coef:
+            constraint.set_linear_coefficients(coef)
+            self.model.solver.update()
+
+    def remove_constraint(self, name):
+        """Remove the constraint called ``name`` if the model carries it.
+
+        DERIVED contract -- freiburgermsu has no such method. Every call site in
+        MSCommunity passes a constraint NAME and fires unconditionally after
+        optional construction, so this is a no-op when the name is unknown
+        rather than an error. A name beginning with ``_`` also removes every
+        constraint whose name ENDS with it: ``regularization`` creates
+        ``<member>_regularization`` per member and clears them all with
+        ``remove_constraint("_regularization")``, so an exact match left them
+        in place and the next pass re-added a duplicate (ContainerAlreadyContains).
+        """
+        try:
+            constraints = [c for c in self.model.constraints
+                           if c.name == name or (name.startswith("_") and c.name.endswith(name))]
+        except Exception:
+            constraints = []
+        if not constraints:
+            return False
+        self.model.remove_cons_vars(constraints)
+        self.model.solver.update()
+        return True
+
+    # -- objective -------------------------------------------------------
+    def add_objective(self, objective, direction="max", coef=None):
+        # DEVIATION: self.model.problem.Objective, not optlang.Objective, so the
+        # objective is built against this model's own solver interface.
+        self.model.objective = self.model.problem.Objective(objective, direction=direction)
+        self.model.solver.update()
+        if coef:
+            self.model.objective.set_linear_coefficients(coef)
+            self.model.solver.update()
+
+    def add_minimal_objective_cons(self, min_value=0.1, objective_expr=None):
+        if "min_value" not in self.model.constraints:
+            objective_expr = objective_expr or self.model.objective.expression
+            # DEVIATION: self.model.problem.Constraint, per add_objective above.
+            self.create_constraint(self.model.problem.Constraint(
+                objective_expr, lb=min_value, ub=None, name="min_value"))
+        else:
+            self.model.constraints["min_value"].lb = min_value
+
+    # -- media / simulation ----------------------------------------------
+    def add_medium(self, media, uniform_uptake=None):
+        if media is None:
+            return self.model.medium
+        exIDs = [exRXN.id for exRXN in self.exchange_list()]
+        if not hasattr(media, "items"):
+            # Port of FBAHelper.convert_kbase_media, absent from the installed
+            # ModelSEEDpy. Verbatim from the freiburgermsu lineage: the uptake
+            # bound is the NEGATED lower bound, which matches cobra's
+            # model.medium convention of positive uptake magnitudes.
+            if not hasattr(media, "get_media_constraints"):
+                raise NotImplementedError(
+                    "add_medium received a medium that is neither a mapping nor "
+                    "an MSMedia (no get_media_constraints); it cannot be "
+                    "converted, and applying NO medium instead would silently "
+                    "leave the model unconstrained. Pass an "
+                    "{exchange_id: uptake} mapping.")
+            constraints = media.get_media_constraints()
+            if uniform_uptake is None:
+                media = {"EX_" + exID: -bound[0] for exID, bound in constraints.items()}
+            else:
+                media = {"EX_" + exID: uniform_uptake for exID in constraints}
+        self.model.medium = {ex: uptake for ex, uptake in media.items() if ex in exIDs}
+        if uniform_uptake is not None:
+            self.model.medium = dict(zip(list(self.model.medium.keys()),
+                                         [uniform_uptake] * len(self.model.medium)))
+        return self.model.medium
+
+    def run_fba(self, media=None, pfba_flag=False, fva_reactions=None):
+        from cobra import flux_analysis
+        if media:
+            self.pkgmgr.getpkg("KBaseMediaPkg").build_package(media)
+        if pfba_flag:
+            return flux_analysis.pfba(self.model)
+        if fva_reactions is not None:
+            return flux_analysis.variability.flux_variability_analysis(
+                self.model, fva_reactions)
+        return self.model.optimize()
+
+
+def make_model_util(model, copy=False, environment=None, climit=None, o2limit=None):
+    """Construct MSModelUtil across ModelSEEDpy signature variants.
+
+    MSCommunity was written against a ModelSEEDpy whose ``MSModelUtil.__init__``
+    accepted ``copy``/``environment``/``climit``/``o2limit``. The installed
+    ModelSEEDpy may accept only ``model``, so each argument is forwarded ONLY if
+    the installed signature has it.
+
+    ``copy`` is honoured locally when unsupported -- dropping it would make
+    MSCommunity mutate the caller's models in place. The remaining arguments
+    cannot be emulated, so a non-default value RAISES rather than being dropped:
+    silently ignoring an uptake limit would yield unconstrained fluxes that look
+    plausible.
+    """
+    import inspect
+
+    params = inspect.signature(MSModelUtil.__init__).parameters
+    kwargs = {}
+
+    if "copy" in params:
+        kwargs["copy"] = copy
+    elif copy:
+        copied = model.copy()
+        copied.objective = model.objective
+        model = copied
+
+    for name, value in (("environment", environment), ("climit", climit), ("o2limit", o2limit)):
+        if name in params:
+            kwargs[name] = value
+        elif value is not None:
+            raise NotImplementedError(
+                f"MSCommunity requested {name}={value!r} but the installed "
+                f"ModelSEEDpy's MSModelUtil does not support it. Dropping it "
+                f"would silently change the simulation, so this is refused."
+            )
+
+    return CompatModelUtil(model, **kwargs)
 
 
 def strip_comp(ID):
@@ -152,15 +352,21 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
                     name, compartment, index = output
                     if compartment != "e":
                         rxn.name = f"{name}_{compartment}{model_index}"
-                        rxn_id = re.search(r"(.+\_\w)(?=\d+)", rxn.id).group()
+                        # The lookahead below can only match an id that ENDS in
+                        # digits, so it must not be evaluated on the `index == ""`
+                        # branch -- which does not use it and which non-ModelSEED
+                        # ids always take. Evaluating it eagerly raised
+                        # AttributeError on .group() for every such id.
                         if index == "":  rxn.id += str(model_index)
-                        else:  rxn.id = rxn_id + str(model_index)
+                        else:
+                            rxn_id = re.search(r"(.+\_\w)(?=\d+)", rxn.id).group()
+                            rxn.id = rxn_id + str(model_index)
                 finalID = str(rxn.id)
                 string_diff = ""
                 for index, let in enumerate(finalID):
                     if index >= len(initialID) or index < len(initialID) and let != initialID[index]: string_diff += let
                 # if "compartment" not in locals():  print(f"the {rxn.id} with a {output} output is not defined with a compartment.")
-                if string_diff != f"_{compartment}{model_index}" or not FBAHelper.isnumber(string_diff) and printing:
+                if string_diff != f"_{compartment}{model_index}" or not isnumber(string_diff) and printing:
                     logger.debug(f"The ID {initialID} is changed with {string_diff} to create the final ID {finalID}")
             new_reactions.add(rxn)
         # else:
@@ -221,7 +427,7 @@ def build_from_species_models(org_models, model_id=None, name=None, abundances=N
     newmodel.add_reactions(sorted(FBAHelper.filter_cobra_set(new_reactions), key=lambda r: r.id))
     newmodel.add_metabolites(sorted(FBAHelper.filter_cobra_set(new_metabolites), key=lambda m: m.id))
     newmodel.add_reactions([comm_biorxn])
-    newutl = MSModelUtil(newmodel, False, climit=climit, o2limit=o2limit)
+    newutl = make_model_util(newmodel, copy=False, climit=climit, o2limit=o2limit)
     newutl.add_objective(comm_biorxn.flux_expression)
     newutl.model.add_boundary(comm_biomass, "sink") # Is a sink reaction for reversible cpd11416_c0 consumption necessary?
     ##TODO proportionally limit the fluxes to their abundances
@@ -269,7 +475,7 @@ def phenotypes(community_members, phenotype_flux_threshold=.1, solver:str="glpk"
         print("\n", org_model.id)
         org_model.solver = solver
         all_phenotypes = "phenotypes" not in content
-        model_util = MSModelUtil(org_model, True)
+        model_util = make_model_util(org_model, copy=True)
         if "org_coef" not in locals():
             org_coef = {model_util.model.reactions.get_by_id("EX_cpd00007_e0").reverse_variable: -1}
         model_util.standard_exchanges()
@@ -288,7 +494,7 @@ def phenotypes(community_members, phenotype_flux_threshold=.1, solver:str="glpk"
         media.update({"EX_cpd11640_e0": 0})
         past_phenoRXNs = []
         for name, phenoCPDs in phenotypes.items():
-            pheno_util = MSModelUtil(model_util.model, True)
+            pheno_util = make_model_util(model_util.model, copy=True)
             metID = phenoCPDs["consumed"][0]
             try:
                 phenoRXN = pheno_util.model.reactions.get_by_id(f'EX_{metID}_e0')

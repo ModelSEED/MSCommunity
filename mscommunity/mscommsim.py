@@ -6,7 +6,7 @@ from modelseedpy.core.msgapfill import MSGapfill
 from modelseedpy.core.fbahelper import FBAHelper
 #from modelseedpy.fbapkg.gapfillingpkg import default_blacklist
 from modelseedpy.core.msatpcorrection import MSATPCorrection
-from mscommunity.commhelper import build_from_species_models
+from mscommunity.commhelper import build_from_species_models, make_model_util
 from mscommunity.commkineticpkg import CommKineticPkg, member_kinetic_reactions
 from mscommunity.mscommviz import interactions as mscommsim_interactions
 from mscommunity.batched_lp import (
@@ -169,13 +169,13 @@ class CommunityMember:
         if self.primary_biomass is None:  logger.critical("No biomass reaction found for species "+self.id)
         self.community.util.add_objective(self.primary_biomass.flux_expression)
         if self.community.lp_filename:  self.community.print_lp(f"{self.community.lp_filename}_{self.id}_Biomass")
-        return self.community.model.optimize()
+        return self.community.util.model.optimize()
 
     def compute_max_atp(self):
         if not self.atp_hydrolysis: logger.critical("No ATP hydrolysis found for species:" + self.id)
         self.community.util.add_objective(Zero, coef={self.atp_hydrolysis.forward_variable: 1})
         if self.community.lp_filename:  self.community.print_lp(f"{self.community.lp_filename}_{self.id}_ATP")
-        return self.community.model.optimize()
+        return self.community.util.model.optimize()
 
 
 class MSCommunity:
@@ -227,7 +227,7 @@ class MSCommunity:
             model = build_from_species_models(member_models, abundances=abundances, printing=printing)
         self.id = ID or model.id
         # self.modelID_names = model.notes["modelID_names"]
-        self.util = MSModelUtil(model, True, None, climit, o2limit)
+        self.util = make_model_util(model, copy=True, environment=None, climit=climit, o2limit=o2limit)
         msid_cobraid_hash = self.util.msid_hash()  # dict of list() of metabolite objects by their msid
         if "cpd11416" not in msid_cobraid_hash:  raise KeyError("Could not find biomass compound for the model.")
         other_biomass_cpds = []
@@ -371,7 +371,7 @@ class MSCommunity:
         reaction_scores = reaction_scores or {}
         if not target:  target = self.primary_biomass.id
         self.set_objective(target, minimize)
-        gfname = FBAHelper.mediaName(media) + "-" + target
+        gfname = FBAHelper.medianame(media) + "-" + target
         if suffix:  gfname += f"-{suffix}"
         # MSGapfill's 7th positional is now `atp_gapfilling`, not solver: set the solver
         # on the model instead of passing it through (a truthy string silently switched
@@ -395,8 +395,8 @@ class MSCommunity:
                 if not interacting:
                     for other in self.members:
                         if other != individual:  other.disable_species()
-                if run_biomass:  data["Biomass"].append(individual.compute_max_biomass())
-                if run_atp:  data["ATP"].append(individual.compute_max_atp())
+                if run_biomass:  data["Biomass"].append(individual.compute_max_biomass().objective_value)
+                if run_atp:  data["ATP"].append(individual.compute_max_atp().objective_value)
         return DataFrame(data)
 
     def atp_correction(self, core_template, atp_medias, max_gapfilling=None, gapfilling_delta=0):
@@ -800,7 +800,8 @@ class MSCommunity:
             else:    print(message)  ;  return None
         abundances = {member.id: self.solution.fluxes[member.primary_biomass.id]/total_growth for member in self.members}
         if update_abundances:
-            self.set_abundance(abundances)
+            # set_abundance takes {id: {"abundance": x, ...}} (the constructor's shape), not bare floats
+            self.set_abundance({memID: {"abundance": abund} for memID, abund in abundances.items()})
             if self.printing:  print(f"Updated abundances: {self.abundances}")
         for mem in self.members:
             ic(f"{mem.id} grows {self.solution.fluxes[mem.primary_biomass.id]} with abundance {mem.abundance}")
