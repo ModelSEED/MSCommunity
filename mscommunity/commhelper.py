@@ -95,7 +95,7 @@ class CompatModelUtil(MSModelUtil):
         self.model.remove_cons_vars(vars_cons)
         self.model.solver.update()
 
-    def create_constraint(self, constraint, coef=None, sloppy=False):
+    def create_constraint(self, constraint, coef=None, sloppy=False, printing=False):
         self.model.add_cons_vars(constraint, sloppy=sloppy)
         self.model.solver.update()
         if coef:
@@ -108,17 +108,20 @@ class CompatModelUtil(MSModelUtil):
         DERIVED contract -- freiburgermsu has no such method. Every call site in
         MSCommunity passes a constraint NAME and fires unconditionally after
         optional construction, so this is a no-op when the name is unknown
-        rather than an error.
+        rather than an error. A name beginning with ``_`` also removes every
+        constraint whose name ENDS with it: ``regularization`` creates
+        ``<member>_regularization`` per member and clears them all with
+        ``remove_constraint("_regularization")``, so an exact match left them
+        in place and the next pass re-added a duplicate (ContainerAlreadyContains).
         """
-        constraint = None
         try:
-            if name in self.model.constraints:
-                constraint = self.model.constraints[name]
+            constraints = [c for c in self.model.constraints
+                           if c.name == name or (name.startswith("_") and c.name.endswith(name))]
         except Exception:
-            constraint = None
-        if constraint is None:
+            constraints = []
+        if not constraints:
             return False
-        self.model.remove_cons_vars([constraint])
+        self.model.remove_cons_vars(constraints)
         self.model.solver.update()
         return True
 

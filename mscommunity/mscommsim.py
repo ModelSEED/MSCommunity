@@ -169,13 +169,13 @@ class CommunityMember:
         if self.primary_biomass is None:  logger.critical("No biomass reaction found for species "+self.id)
         self.community.util.add_objective(self.primary_biomass.flux_expression)
         if self.community.lp_filename:  self.community.print_lp(f"{self.community.lp_filename}_{self.id}_Biomass")
-        return self.community.model.optimize()
+        return self.community.util.model.optimize()
 
     def compute_max_atp(self):
         if not self.atp_hydrolysis: logger.critical("No ATP hydrolysis found for species:" + self.id)
         self.community.util.add_objective(Zero, coef={self.atp_hydrolysis.forward_variable: 1})
         if self.community.lp_filename:  self.community.print_lp(f"{self.community.lp_filename}_{self.id}_ATP")
-        return self.community.model.optimize()
+        return self.community.util.model.optimize()
 
 
 class MSCommunity:
@@ -395,8 +395,8 @@ class MSCommunity:
                 if not interacting:
                     for other in self.members:
                         if other != individual:  other.disable_species()
-                if run_biomass:  data["Biomass"].append(individual.compute_max_biomass())
-                if run_atp:  data["ATP"].append(individual.compute_max_atp())
+                if run_biomass:  data["Biomass"].append(individual.compute_max_biomass().objective_value)
+                if run_atp:  data["ATP"].append(individual.compute_max_atp().objective_value)
         return DataFrame(data)
 
     def atp_correction(self, core_template, atp_medias, max_gapfilling=None, gapfilling_delta=0):
@@ -800,7 +800,8 @@ class MSCommunity:
             else:    print(message)  ;  return None
         abundances = {member.id: self.solution.fluxes[member.primary_biomass.id]/total_growth for member in self.members}
         if update_abundances:
-            self.set_abundance(abundances)
+            # set_abundance takes {id: {"abundance": x, ...}} (the constructor's shape), not bare floats
+            self.set_abundance({memID: {"abundance": abund} for memID, abund in abundances.items()})
             if self.printing:  print(f"Updated abundances: {self.abundances}")
         for mem in self.members:
             ic(f"{mem.id} grows {self.solution.fluxes[mem.primary_biomass.id]} with abundance {mem.abundance}")
